@@ -145,6 +145,18 @@ test('override auto-cleared when card reaches In Test or Done', () => {
   expect(s3.override).toBe('waiting_review');
 });
 
+test('stale in_qa override auto-cleared when card reaches In Test, routes to qa_ready', () => {
+  // Regression: auto-clear must fire for any override value, not just the natural
+  // bucket name. When the bucket for In Test was renamed from in_qa to qa_ready,
+  // a check like cs.override === 'in_qa' would silently stop clearing waiting_review
+  // (and other developer-side) overrides. This test pins the in_qa case specifically.
+  const s = cs({ override: 'in_qa', overrideAt: '2026-07-01T00:00:00Z' });
+  const r = classifyCard({ ...base, card: card({ status: 'In Test' }), pr: null, cs: s });
+  expect(s.override).toBeNull();
+  expect(s.overrideAt).toBeNull();
+  expect(r.bucket).toBe('qa_ready');
+});
+
 test('junk (comment-reason) entries in ackedReasons are dropped, never muting comment attention', () => {
   const c = cs({ ackedReasons: ['new_pr_comments'] });
   const p = pr({ comments: [{ author: 'reviewer', body: 'x', createdAt: '2026-07-02T00:00:00Z' }] });
