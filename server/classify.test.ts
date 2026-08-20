@@ -288,3 +288,25 @@ test('In Test card whose only comment is from an ignored author stays in qa_read
   expect(r.attention).not.toContain('new_jira_comments');
   expect(r.bucket).toBe('qa_ready');
 });
+
+// #53. Simon labels every PR it opens "Draft" (github.ts maps that label to
+// isDraft), so its cards sit in Self Review Needed until the label comes off.
+// Moving the Jira card to Code Review is the operator saying "I have reviewed
+// this, it is out for peer review" — an explicit lifecycle statement that the
+// draft rule used to outrank, leaving the card in Self Review Needed forever.
+test('a draft PR whose card is in a review status -> waiting_review', () => {
+  const draft = pr({ isDraft: true });
+  expect(classifyCard({ ...base, card: card(), pr: draft, cs: cs() }).bucket).toBe('self_review');
+  expect(classifyCard({ ...base, card: card({ status: 'Code Review' }), pr: draft, cs: cs() }).bucket).toBe('waiting_review');
+  expect(classifyCard({ ...base, card: card({ status: 'In Review' }), pr: draft, cs: cs() }).bucket).toBe('waiting_review');
+});
+
+// The review status is a lifecycle statement, not an override of blocked-or-
+// broken: ROUTING_REASONS still evict the card (#42/#46), a pin still wins,
+// and a draft never claims Mergeable — it cannot be merged as it stands.
+test('a draft PR in a review status yields to routing reasons, pins, and never reads as mergeable', () => {
+  const inReview = card({ status: 'Code Review' });
+  expect(classifyCard({ ...base, card: inReview, pr: pr({ isDraft: true, ciStatus: 'failing' }), cs: cs() }).bucket).toBe('needs_attention');
+  expect(classifyCard({ ...base, card: inReview, pr: pr({ isDraft: true }), cs: cs({ override: 'in_qa' }) }).bucket).toBe('in_qa');
+  expect(classifyCard({ ...base, card: inReview, pr: pr({ isDraft: true, reviewState: 'approved' }), cs: cs() }).bucket).toBe('waiting_review');
+});

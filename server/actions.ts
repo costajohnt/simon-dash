@@ -1,5 +1,5 @@
 import { cardState } from './state.ts';
-import { STATE_REASONS } from './classify.ts';
+import { STATE_REASONS, isReviewStatus } from './classify.ts';
 import type { State, Config, Bucket, ActionResult, Item } from './types.ts';
 
 export const BUCKETS: Bucket[] = ['in_progress', 'self_review', 'waiting_review', 'mergeable', 'qa_ready', 'in_qa'];
@@ -20,19 +20,23 @@ const ackReasons = (prior: string[] | null | undefined, attention: string[]): st
 // waiting for the next refresh.
 //
 // Deliberately mirrors classifyCard's order (classify.ts), including the
-// draft-PR rule that outranks everything: ack used to compute this inline
-// without the draft check, so acking a card on an approved draft PR sent it
-// to `mergeable` while the next refresh moved it straight back to
-// `self_review`. Shared between ack and unpin so the two can't drift from
-// each other or from the classifier.
+// draft-PR rule that outranks everything and its one exception (a card in a
+// review status is out for peer review, so the draft stops holding it in
+// self_review): ack used to compute this inline without the draft check, so
+// acking a card on an approved draft PR sent it to `mergeable` while the next
+// refresh moved it straight back to `self_review`. Shared between ack and
+// unpin so the two can't drift from each other or from the classifier.
 export function classifierDest(item: Item, config: Config): Bucket {
   const pr = item.pr;
-  if (pr?.state === 'open' && pr.isDraft) return 'self_review';
+  const draftOpen = pr?.state === 'open' && !!pr.isDraft;
+  const outForReview = isReviewStatus(item.jiraStatus);
+  if (draftOpen && !outForReview) return 'self_review';
   if (item.attention.length) return 'needs_attention';
   if (item.jiraStatus === config.jira?.statuses?.inTest) return 'qa_ready';
+  if (draftOpen) return 'waiting_review';
   if (pr?.state === 'open') {
     if (pr.reviewState === 'approved') return 'mergeable';
-    if (item.jiraStatus === 'Code Review' || item.jiraStatus === 'In Review' || pr.reviewState !== 'none') return 'waiting_review';
+    if (outForReview || pr.reviewState !== 'none') return 'waiting_review';
     return 'self_review';
   }
   return 'in_progress';
