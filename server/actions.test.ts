@@ -250,3 +250,14 @@ test('acking a card on an approved draft PR lands where the classifier would put
   // destination the very next refresh undoes.
   expect(applyAction({ state, config, type: 'ack', key: 'P-1' })).toMatchObject({ ok: true, bucket: 'self_review' });
 });
+
+// classifierDest mirrors classifyCard, so it has to mirror the #53 exception
+// too: a draft PR whose card is in a review status is out for peer review.
+test('acking a card on a draft PR in a review status lands in waiting_review', () => {
+  const state = stateWithItem();
+  const item = state.snapshot!.buckets.needs_attention[0]!;
+  item.jiraStatus = 'Code Review';
+  item.pr = { repo: 'o/r', number: 1, url: 'u', branch: 'b', state: 'open', ciStatus: 'passing', reviewState: 'none', isDraft: true };
+
+  expect(applyAction({ state, config, type: 'ack', key: 'P-1' })).toMatchObject({ ok: true, bucket: 'waiting_review' });
+});

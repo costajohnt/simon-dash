@@ -35,6 +35,12 @@ export const STATE_REASONS: readonly string[] = ['ci_failing', 'merged_not_in_te
 // into Needs Attention on the day it shipped.
 export const ROUTING_REASONS: readonly string[] = ['ci_failing', 'merged_not_in_test'];
 
+// The Jira statuses that mean "this is out for peer review". Hard-coded names
+// (not config) because that is how they have always been matched here; the one
+// definition is shared with actions.ts's classifierDest so the two cannot drift.
+export const isReviewStatus = (status: string): boolean =>
+  status === 'Code Review' || status === 'In Review';
+
 // QA-instructions heuristic for In Test cards: a line mentioning "QA
 // instructions" / "QA test instructions" / "test instructions" anywhere in
 // the (ADF-flattened) description counts. ponytail: naive substring check,
@@ -113,8 +119,18 @@ export function classifyCard({ card, pr, cs, statuses, username, ignoreAuthors =
     cs.overrideAt = null;
   }
 
+  // A draft PR is the executor's "I finished, you look at it first" signal
+  // (github.ts maps a `Draft` label onto isDraft, which is how Simon marks
+  // every PR it opens). Moving the Jira card to a review status is the
+  // operator answering "I have looked, it is out for peer review" — an
+  // explicit lifecycle statement, so the draft no longer holds the card in
+  // Self Review Needed. Same principle as #42: a card belongs in the column
+  // its status earns unless something is blocked or broken.
+  const draftOpen = pr?.state === 'open' && !!pr.isDraft;
+  const outForReview = isReviewStatus(card.status);
+
   let bucket: Bucket;
-  if (pr?.state === 'open' && pr.isDraft) {
+  if (draftOpen && !outForReview) {
     bucket = 'self_review';
   } else if (visible.some(r => ROUTING_REASONS.includes(r))) bucket = 'needs_attention';
   else if (cs.override) bucket = cs.override;
@@ -134,10 +150,13 @@ export function classifyCard({ card, pr, cs, statuses, username, ignoreAuthors =
   else if (card.status === statuses.inTest) {
     bucket = visible.includes('new_jira_comments') ? 'needs_attention' : 'qa_ready';
   }
+  // Checked before the approved branch below: a draft PR cannot be merged as
+  // it stands, so it must not read as Mergeable however its reviews landed.
+  else if (draftOpen) bucket = 'waiting_review';
   else if (pr?.state === 'open') {
     if (pr.reviewState === 'approved') {
       bucket = 'mergeable';
-    } else if (card.status === 'Code Review' || card.status === 'In Review' || pr.reviewState !== 'none') {
+    } else if (outForReview || pr.reviewState !== 'none') {
       bucket = 'waiting_review';
     } else {
       bucket = 'self_review';
