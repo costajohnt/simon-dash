@@ -262,6 +262,19 @@ test('classifierDest sends a Code Review card with no PR to waiting_review (#64)
   expect(classifierDest(item, config)).toBe('waiting_review');
 });
 
+test('classifierDest routes a re-cased inTest status to qa_ready', () => {
+  const state = stateWithItem();
+  const item = { ...state.snapshot!.buckets.needs_attention[0]!, jiraStatus: 'in test', attention: [], pr: null };
+  expect(classifierDest(item, config)).toBe('qa_ready');
+});
+
+test('ack routes to qa_ready when jiraStatus has a re-cased inTest value', () => {
+  const state = stateWithItem();
+  state.snapshot!.buckets.needs_attention[0]!.jiraStatus = 'in test';
+  const result = applyAction({ state, config, type: 'ack', key: 'P-1' }) as LooseResult;
+  expect(result.bucket).toBe('qa_ready');
+});
+
 test('classifierDest and the classifier agree on an unpinned Code Review card', () => {
   const state = stateWithItem();
   const item = state.snapshot!.buckets.needs_attention[0]!;

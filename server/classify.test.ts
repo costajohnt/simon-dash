@@ -1,5 +1,5 @@
 import { test, expect } from 'vitest';
-import { classifyCard, isTodo, isDone, isCanceled } from './classify.ts';
+import { classifyCard, isTodo, isDone, isCanceled, sameStatus } from './classify.ts';
 import type { Card, Pr, CardState, JiraStatuses } from './types.ts';
 
 const statuses: JiraStatuses = { todo: 'To Do', inTest: 'In Test', done: 'Done', canceled: 'Canceled' };
@@ -350,4 +350,83 @@ test('an unrelated in-flight status with no PR is still in_progress', () => {
   for (const status of ['In Progress', 'Reviewing the docs', 'Blocked']) {
     expect(classifyCard({ ...base, card: card({ status }), pr: null, cs: cs() }).bucket).toBe('in_progress');
   }
+});
+
+// --- sameStatus helper ---
+
+test('sameStatus matches identical strings', () => {
+  expect(sameStatus('In Test', 'In Test')).toBe(true);
+  expect(sameStatus('Done', 'Done')).toBe(true);
+});
+
+test('sameStatus matches case-insensitively', () => {
+  expect(sameStatus('in test', 'In Test')).toBe(true);
+  expect(sameStatus('IN TEST', 'in test')).toBe(true);
+  expect(sameStatus('done', 'Done')).toBe(true);
+  expect(sameStatus('DONE', 'done')).toBe(true);
+});
+
+test('sameStatus trims surrounding whitespace', () => {
+  expect(sameStatus('  In Test  ', 'In Test')).toBe(true);
+  expect(sameStatus('In Test', '  In Test  ')).toBe(true);
+});
+
+test('sameStatus returns false for different statuses', () => {
+  expect(sameStatus('In Test', 'Done')).toBe(false);
+  expect(sameStatus('In Progress', 'In Test')).toBe(false);
+});
+
+test('sameStatus returns false when either operand is absent', () => {
+  expect(sameStatus(undefined, 'In Test')).toBe(false);
+  expect(sameStatus('In Test', undefined)).toBe(false);
+  expect(sameStatus(undefined, undefined)).toBe(false);
+});
+
+// --- case-insensitive status routing via sameStatus ---
+
+test('merged with re-cased inTest status still suppresses merged_not_in_test', () => {
+  const m = pr({ state: 'merged' });
+  const r = classifyCard({ ...base, card: card({ status: 'in test', description: 'QA instructions: click it' }), pr: m, cs: cs() });
+  expect(r.attention).not.toContain('merged_not_in_test');
+  expect(r.bucket).toBe('qa_ready');
+});
+
+test('merged with re-cased done status still suppresses merged_not_in_test', () => {
+  const m = pr({ state: 'merged' });
+  expect(classifyCard({ ...base, card: card({ status: 'done' }), pr: m, cs: cs() }).attention).not.toContain('merged_not_in_test');
+});
+
+test('re-cased inTest still routes to qa_ready', () => {
+  expect(classifyCard({ ...base, card: card({ status: 'IN TEST', description: 'QA instructions: click it', fixVersions: ['1.0'] }), pr: null, cs: cs() }).bucket).toBe('qa_ready');
+});
+
+test('re-cased inTest still triggers missing_qa_instructions and missing_fix_version', () => {
+  const r = classifyCard({ ...base, card: card({ status: 'IN TEST', description: 'just a fix' }), pr: null, cs: cs() });
+  expect(r.attention).toContain('missing_qa_instructions');
+  expect(r.attention).toContain('missing_fix_version');
+});
+
+test('override auto-cleared on re-cased inTest and done', () => {
+  const s = cs({ override: 'waiting_review', overrideAt: '2026-07-01T00:00:00Z' });
+  classifyCard({ ...base, card: card({ status: 'in test', description: 'QA instructions: click it' }), pr: null, cs: s });
+  expect(s.override).toBeNull();
+  const s2 = cs({ override: 'self_review', overrideAt: '2026-07-01T00:00:00Z' });
+  classifyCard({ ...base, card: card({ status: '  Done  ' }), pr: null, cs: s2 });
+  expect(s2.override).toBeNull();
+});
+
+test('isCanceled matches case-insensitively', () => {
+  expect(isCanceled(card({ status: 'canceled' }), statuses)).toBe(true);
+  expect(isCanceled(card({ status: 'CANCELED' }), statuses)).toBe(true);
+  expect(isCanceled(card({ status: '  Canceled  ' }), statuses)).toBe(true);
+});
+
+test('isTodo matches case-insensitively on exact-name fallback', () => {
+  expect(isTodo(card({ status: 'to do' }), statuses)).toBe(true);
+  expect(isTodo(card({ status: 'TO DO' }), statuses)).toBe(true);
+});
+
+test('isDone matches case-insensitively on exact-name fallback', () => {
+  expect(isDone(card({ status: 'done' }), statuses)).toBe(true);
+  expect(isDone(card({ status: 'DONE' }), statuses)).toBe(true);
 });
