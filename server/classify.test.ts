@@ -1,5 +1,5 @@
 import { test, expect } from 'vitest';
-import { classifyCard, isTodo, isDone, isCanceled } from './classify.ts';
+import { classifyCard, isTodo, isDone, isCanceled, sameStatus } from './classify.ts';
 import type { Card, Pr, CardState, JiraStatuses } from './types.ts';
 
 const statuses: JiraStatuses = { todo: 'To Do', inTest: 'In Test', done: 'Done', canceled: 'Canceled' };
@@ -152,6 +152,28 @@ test('override auto-cleared when card reaches In Test or Done', () => {
   expect(s3.override).toBe('waiting_review');
 });
 
+test('pin released on Jira status transition; card falls to classifier bucket (#53)', () => {
+  // Pinned to In Progress while addressing review feedback; card then
+  // transitions In Progress -> Code Review in Jira.
+  const s = cs({ override: 'in_progress', overrideAt: '2026-07-01T00:00:00Z', lastStatus: 'In Progress' });
+  const r = classifyCard({ ...base, card: card({ status: 'Code Review' }), pr: pr(), cs: s });
+  expect(s.override).toBeNull();
+  expect(s.overrideAt).toBeNull();
+  expect(r.bucket).toBe('waiting_review');
+  expect(s.lastStatus).toBe('Code Review');
+
+  // Same status as last refresh: pin holds.
+  const s2 = cs({ override: 'in_qa', overrideAt: '2026-07-01T00:00:00Z', lastStatus: 'In Progress' });
+  expect(classifyCard({ ...base, card: card(), pr: pr(), cs: s2 }).bucket).toBe('in_qa');
+  expect(s2.override).toBe('in_qa');
+
+  // Pre-existing state file (no lastStatus yet): first refresh only records it.
+  const s3 = cs({ override: 'in_qa', overrideAt: '2026-07-01T00:00:00Z' });
+  expect(classifyCard({ ...base, card: card(), pr: pr(), cs: s3 }).bucket).toBe('in_qa');
+  expect(s3.override).toBe('in_qa');
+  expect(s3.lastStatus).toBe('In Progress');
+});
+
 test('junk (comment-reason) entries in ackedReasons are dropped, never muting comment attention', () => {
   const c = cs({ ackedReasons: ['new_pr_comments'] });
   const p = pr({ comments: [{ author: 'reviewer', body: 'x', createdAt: '2026-07-02T00:00:00Z' }] });
@@ -289,24 +311,121 @@ test('In Test card whose only comment is from an ignored author stays in qa_read
   expect(r.bucket).toBe('qa_ready');
 });
 
+// #64: a card moved to Code Review in Jira sat in In Progress forever, because
+// the Code Review check lived inside the `pr?.state === 'open'` branch — so the
+// developer's own statement about the work only counted if the board had
+// already linked an open PR.
+test('Code Review with no PR at all -> waiting_review, not in_progress', () => {
+  expect(classifyCard({ ...base, card: card({ status: 'Code Review' }), pr: null, cs: cs() }).bucket).toBe('waiting_review');
+});
+
+test('Code Review still routes to waiting_review with an open unreviewed PR', () => {
+  expect(classifyCard({ ...base, card: card({ status: 'Code Review' }), pr: pr(), cs: cs() }).bucket).toBe('waiting_review');
+});
+
+// The PR state is more specific than the Jira status where they disagree, so
+// these two must not regress into waiting_review.
+test('an approved PR still beats a Code Review status', () => {
+  expect(classifyCard({ ...base, card: card({ status: 'Code Review' }), pr: pr({ reviewState: 'approved' }), cs: cs() }).bucket).toBe('mergeable');
+});
+
+// The draft PR is the one exception, reversed by #53: Simon labels every PR it
+// opens `Draft`, so "PR state is more specific" left every executor-shipped card
+// stuck in Self Review Needed. Moving the card to a review status is the
+// operator overriding that. An approved PR (above) still wins.
+test('a draft PR yields to a Code Review status (#53)', () => {
+  expect(classifyCard({ ...base, card: card({ status: 'Code Review' }), pr: pr({ isDraft: true }), cs: cs() }).bucket).toBe('waiting_review');
+  expect(classifyCard({ ...base, card: card({ status: 'In Progress' }), pr: pr({ isDraft: true }), cs: cs() }).bucket).toBe('self_review');
+});
+
+// A Jira status name is free text an admin can edit or re-case.
+test('the review status matches case-insensitively and ignores surrounding space', () => {
+  for (const status of ['code review', 'CODE REVIEW', '  In Review  ', 'in review']) {
+    expect(classifyCard({ ...base, card: card({ status }), pr: null, cs: cs() }).bucket).toBe('waiting_review');
+  }
+});
+
+test('a project that renamed the status configures it, and the stock names keep working', () => {
+  const renamed: JiraStatuses = { ...statuses, review: 'Peer Review' };
+  expect(classifyCard({ ...base, statuses: renamed, card: card({ status: 'Peer Review' }), pr: null, cs: cs() }).bucket).toBe('waiting_review');
+  expect(classifyCard({ ...base, statuses: renamed, card: card({ status: 'Code Review' }), pr: null, cs: cs() }).bucket).toBe('waiting_review');
+});
+
+test('an unrelated in-flight status with no PR is still in_progress', () => {
+  for (const status of ['In Progress', 'Reviewing the docs', 'Blocked']) {
+    expect(classifyCard({ ...base, card: card({ status }), pr: null, cs: cs() }).bucket).toBe('in_progress');
+  }
+});
+
+// #67: only isInReview normalized, so a project whose column read "in test"
+// routed review case-insensitively and In Test not at all. Every status
+// comparison now goes through sameStatus, so each gets its own re-cased case.
+test('In Test matches case-insensitively and ignores surrounding space', () => {
+  for (const status of ['in test', 'IN TEST', '  In Test  ']) {
+    const c = card({ status, description: 'QA instructions: click it', fixVersions: ['1.0'] });
+    expect(classifyCard({ ...base, card: c, pr: null, cs: cs() }).bucket).toBe('qa_ready');
+    // The same comparison gates the merged-not-in-test attention reason and
+    // the auto-clear of a stale override.
+    expect(classifyCard({ ...base, card: c, pr: pr({ state: 'merged' }), cs: cs() }).attention).not.toContain('merged_not_in_test');
+    const pinned = cs({ override: 'in_progress', lastStatus: status });
+    classifyCard({ ...base, card: c, pr: null, cs: pinned });
+    expect(pinned.override).toBeNull();
+  }
+});
+
+test('Done, To Do and Canceled match case-insensitively and ignore surrounding space', () => {
+  for (const status of ['done', 'DONE', '  Done  ']) expect(isDone(card({ status }), statuses)).toBe(true);
+  for (const status of ['to do', 'TO DO', '  To Do  ']) expect(isTodo(card({ status }), statuses)).toBe(true);
+  for (const status of ['canceled', 'CANCELED', '  Canceled  ']) {
+    expect(isCanceled(card({ status }), statuses)).toBe(true);
+    // Canceled sits in the Done category but is an abandonment, not a
+    // completion — normalizing must not blur that.
+    expect(isDone(card({ status }), statuses)).toBe(false);
+  }
+});
+
+test('a project that re-cased its statuses in Jira still routes Done and merged-not-in-test', () => {
+  const recased: JiraStatuses = { todo: 'to do', inTest: 'in test', done: 'done', canceled: 'canceled' };
+  expect(isDone(card({ status: 'Done' }), recased)).toBe(true);
+  expect(classifyCard({ ...base, statuses: recased, card: card({ status: 'In Progress' }), pr: pr({ state: 'merged' }), cs: cs() }).attention)
+    .toContain('merged_not_in_test');
+});
+
+// sameStatus must not treat "both missing" as a match: a card with no status
+// and a config with no canceled name are not the same status.
+test('sameStatus never matches a blank or missing status', () => {
+  expect(sameStatus(undefined, undefined)).toBe(false);
+  expect(sameStatus('   ', '')).toBe(false);
+  expect(sameStatus('Done', undefined)).toBe(false);
+  expect(sameStatus(' Done ', 'done')).toBe(true);
+});
+
 // #53. Simon labels every PR it opens "Draft" (github.ts maps that label to
 // isDraft), so its cards sit in Self Review Needed until the label comes off.
 // Moving the Jira card to Code Review is the operator saying "I have reviewed
 // this, it is out for peer review" — an explicit lifecycle statement that the
 // draft rule used to outrank, leaving the card in Self Review Needed forever.
-test('a draft PR whose card is in a review status -> waiting_review', () => {
+test('a draft PR whose card is in a review status -> waiting_review (#53)', () => {
   const draft = pr({ isDraft: true });
   expect(classifyCard({ ...base, card: card(), pr: draft, cs: cs() }).bucket).toBe('self_review');
-  expect(classifyCard({ ...base, card: card({ status: 'Code Review' }), pr: draft, cs: cs() }).bucket).toBe('waiting_review');
-  expect(classifyCard({ ...base, card: card({ status: 'In Review' }), pr: draft, cs: cs() }).bucket).toBe('waiting_review');
+  for (const status of ['Code Review', 'In Review', 'code review']) {
+    expect(classifyCard({ ...base, card: card({ status }), pr: draft, cs: cs() }).bucket).toBe('waiting_review');
+  }
 });
 
 // The review status is a lifecycle statement, not an override of blocked-or-
 // broken: ROUTING_REASONS still evict the card (#42/#46), a pin still wins,
 // and a draft never claims Mergeable — it cannot be merged as it stands.
-test('a draft PR in a review status yields to routing reasons, pins, and never reads as mergeable', () => {
+test('a draft PR in a review status yields to routing reasons and pins, and never reads as mergeable', () => {
   const inReview = card({ status: 'Code Review' });
   expect(classifyCard({ ...base, card: inReview, pr: pr({ isDraft: true, ciStatus: 'failing' }), cs: cs() }).bucket).toBe('needs_attention');
   expect(classifyCard({ ...base, card: inReview, pr: pr({ isDraft: true }), cs: cs({ override: 'in_qa' }) }).bucket).toBe('in_qa');
   expect(classifyCard({ ...base, card: inReview, pr: pr({ isDraft: true, reviewState: 'approved' }), cs: cs() }).bucket).toBe('waiting_review');
+});
+
+// The exception is scoped to review statuses and nothing else: a draft PR on a
+// card in any other status still routes to Self Review Needed exactly as before.
+test('the #53 draft exception does not fire on a non-review status', () => {
+  const c = card({ status: 'In Test', description: 'QA instructions: click it', fixVersions: ['1.0'] });
+  expect(classifyCard({ ...base, card: c, pr: pr({ isDraft: true }), cs: cs() }).bucket).toBe('self_review');
 });

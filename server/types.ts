@@ -16,6 +16,10 @@ export interface JiraStatuses {
   // from the whole dashboard. Optional so existing { todo, inTest, done }
   // config/test fixtures keep working; defaults to 'Canceled' in loadConfig.
   canceled?: string;
+  // Status name that means the work is out for review. Optional: the two
+  // common Jira defaults ('Code Review', 'In Review') are always recognised,
+  // so this only needs setting for a project that renamed it (#64).
+  review?: string;
 }
 
 // Jira status categories: every status rolls up to one of these three. Used
@@ -280,6 +284,10 @@ export interface CardState {
   // acknowledged; classifyCard mutes and prunes these — see the comment
   // there. Optional: absent in pre-existing state files.
   ackedReasons?: string[] | null;
+  // Jira status as of the last refresh. classifyCard compares against it to
+  // spot a status transition and release a stale pin (#53). Optional: absent
+  // in pre-existing state files.
+  lastStatus?: string | null;
 }
 
 export interface CelebratedEntry {
