@@ -242,10 +242,12 @@ export function buildSnapshot({ cards, prs, state, config, errors, degradedPrRep
 // How close an enrichment may sit to the updatedAt it read before the
 // same-second hole (see the enrichment skip in refresh()) makes it
 // unconfirmed (#75). Two seconds covers the second-granularity rounding plus
-// clock skew between GitHub and this host.
+// modest clock skew between GitHub and this host; a larger skew is why the
+// caller also records enrichConfirmed rather than trusting this test alone.
 const UNCONFIRMED_ENRICHMENT_MS = 2_000;
 
 function enrichmentUnconfirmed(last: Pr): boolean {
+  if (last.enrichConfirmed) return false;
   if (!last.enrichedAt) return true;
   return Date.parse(last.updatedAt) >= Date.parse(last.enrichedAt) - UNCONFIRMED_ENRICHMENT_MS;
 }
@@ -354,15 +356,25 @@ async function runRefresh({ config, state, quiet }: { config: Config; state: Sta
     // read leaves updatedAt equal while the comment list is stale, and
     // nothing bumps it again until the next PR event, which on a quiet PR can
     // be days. An enrichment recorded that close to the updatedAt it saw is
-    // therefore unconfirmed and is fetched once more; the re-fetch stamps an
-    // enrichedAt well past updatedAt, so the refresh after that reuses it as
-    // usual. A last-known PR with no enrichedAt at all (state written before
-    // the stamp existed) takes the same one-time re-fetch.
+    // therefore unconfirmed and is fetched once more. That re-fetch runs a
+    // whole poll later, so it sees any same-second comment, and the row is
+    // marked enrichConfirmed for this updatedAt: the time test is not trusted
+    // to settle on its own, since a host clock running behind GitHub's would
+    // keep it true on every poll. Only a moved updatedAt (a fresh enrichPr
+    // result, which carries no flag) reopens the question. A last-known PR
+    // with no enrichedAt at all (state written before the stamp existed)
+    // takes the same one-time re-fetch.
     const previous = new Map((state.lastPrs ?? []).map(p => [`${p.repo}#${p.number}`, p]));
     const toEnrich: Pr[] = [];
     for (const p of new Set(linked.values())) {
       const last = previous.get(`${p.repo}#${p.number}`);
-      if (!last?.enriched || last.updatedAt !== p.updatedAt || enrichmentUnconfirmed(last)) { toEnrich.push(p); continue; }
+      if (!last?.enriched || last.updatedAt !== p.updatedAt) { toEnrich.push(p); continue; }
+      // Same updatedAt as last time: either re-check it once, or reuse it.
+      // Either way this updatedAt is confirmed from here on. (A rejected
+      // re-check is replaced by its unflagged last-known row below, so the
+      // next refresh tries again.)
+      p.enrichConfirmed = true;
+      if (enrichmentUnconfirmed(last)) { toEnrich.push(p); continue; }
       p.comments = last.comments;
       if (p.reviewState !== 'review_required') p.reviewState = last.reviewState;
       p.enriched = true;

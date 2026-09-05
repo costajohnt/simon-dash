@@ -570,23 +570,56 @@ test('an enrichment recorded in the same second as the PR\'s updatedAt is re-enr
     comments: [{ author: 'a', body: 'stale', createdAt: at }] })];
   vi.mocked(fetchPrs).mockResolvedValueOnce({ prs: [pr({ updatedAt: at })], errors: [] });
   vi.mocked(enrichPr).mockClear();
+  // The re-check runs on the next poll, 30s later here, and sees the comment
+  // that landed in the same second as updatedAt.
   vi.mocked(enrichPr).mockImplementationOnce(async (p: Pr) => {
     p.comments = [{ author: 'a', body: 'stale', createdAt: at }, { author: 'b', body: 'same-second', createdAt: at }];
     p.enriched = true;
-    p.enrichedAt = '2026-07-02T00:05:00Z';
+    p.enrichedAt = '2026-07-02T00:00:30Z';
     return p;
   });
   const first = await refresh({ config, state });
   expect(enrichPr).toHaveBeenCalledTimes(1);
   expect(first.buckets.self_review[0]?.comments.map(c => c.body)).toEqual(['stale', 'same-second']);
+  expect(state.lastPrs?.[0]?.enrichConfirmed).toBe(true);
 
-  // Now stamped minutes past updatedAt: the next refresh reuses it and carries
-  // the stamp forward, so the one-time re-fetch stays one-time.
+  // Confirmed for this updatedAt: the next refresh reuses it and carries the
+  // stamp and the flag forward, so the one-time re-fetch stays one-time.
   vi.mocked(fetchPrs).mockResolvedValueOnce({ prs: [pr({ updatedAt: at })], errors: [] });
   const second = await refresh({ config, state });
   expect(enrichPr).toHaveBeenCalledTimes(1);
   expect(second.buckets.self_review[0]?.comments).toHaveLength(2);
-  expect(state.lastPrs?.[0]?.enrichedAt).toBe('2026-07-02T00:05:00Z');
+  expect(state.lastPrs?.[0]?.enrichedAt).toBe('2026-07-02T00:00:30Z');
+  expect(state.lastPrs?.[0]?.enrichConfirmed).toBe(true);
+
+  // A moved updatedAt reopens the question: the fresh row is enriched again
+  // and its result carries no flag until the following poll settles it.
+  vi.mocked(fetchPrs).mockResolvedValueOnce({ prs: [pr({ updatedAt: '2026-07-02T00:02:00Z' })], errors: [] });
+  await refresh({ config, state });
+  expect(enrichPr).toHaveBeenCalledTimes(2);
+});
+
+// A host clock 5s behind GitHub's keeps every enrichment stamp "within 2s of"
+// (in fact before) the updatedAt it read, so the time test alone would re-fetch
+// a quiet PR on every poll forever. The confirmed flag is what stops it.
+test('a host clock behind GitHub does not re-enrich a quiet PR on every poll: exactly once, then reused', async () => {
+  const { fetchPrs, enrichPr } = await import('./github.ts');
+  const at = '2026-07-02T00:00:00Z';
+  const state = emptyState();
+  state.lastCards = [card()];
+  state.lastPrs = [pr({ updatedAt: at, enriched: true, enrichedAt: '2026-07-01T23:59:55Z' })];
+  vi.mocked(enrichPr).mockClear();
+  // The clock is still 5s behind on the re-check, two seconds later.
+  vi.mocked(enrichPr).mockImplementationOnce(async (p: Pr) => { p.enriched = true; p.enrichedAt = '2026-07-01T23:59:57Z'; return p; });
+  vi.mocked(fetchPrs).mockResolvedValueOnce({ prs: [pr({ updatedAt: at })], errors: [] });
+  await refresh({ config, state });
+  expect(enrichPr).toHaveBeenCalledTimes(1);
+  vi.mocked(fetchPrs).mockResolvedValueOnce({ prs: [pr({ updatedAt: at })], errors: [] });
+  await refresh({ config, state });
+  expect(enrichPr).toHaveBeenCalledTimes(1);
+  vi.mocked(fetchPrs).mockResolvedValueOnce({ prs: [pr({ updatedAt: at })], errors: [] });
+  await refresh({ config, state });
+  expect(enrichPr).toHaveBeenCalledTimes(1);
 });
 
 test('a last-known PR enriched before enrichedAt existed is re-enriched once rather than trusted', async () => {
