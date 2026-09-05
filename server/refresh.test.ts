@@ -557,6 +557,49 @@ test('enrichPr runs in capped batches, so a big board cannot trip the secondary 
   expect(startedAt[3]! - startedAt[0]!).toBeGreaterThanOrEqual(200);
 });
 
+// #75: GitHub's timestamps are whole seconds, so a comment landing in the same
+// second as the updatedAt an enrichment read leaves updatedAt equal while the
+// comment list is stale, until the next PR event. An enrichment recorded that
+// close to the updatedAt it saw is fetched once more instead of reused.
+test('an enrichment recorded in the same second as the PR\'s updatedAt is re-enriched once, then reused', async () => {
+  const { fetchPrs, enrichPr } = await import('./github.ts');
+  const at = '2026-07-02T00:00:00Z';
+  const state = emptyState();
+  state.lastCards = [card()];
+  state.lastPrs = [pr({ updatedAt: at, enriched: true, enrichedAt: '2026-07-02T00:00:00.700Z',
+    comments: [{ author: 'a', body: 'stale', createdAt: at }] })];
+  vi.mocked(fetchPrs).mockResolvedValueOnce({ prs: [pr({ updatedAt: at })], errors: [] });
+  vi.mocked(enrichPr).mockClear();
+  vi.mocked(enrichPr).mockImplementationOnce(async (p: Pr) => {
+    p.comments = [{ author: 'a', body: 'stale', createdAt: at }, { author: 'b', body: 'same-second', createdAt: at }];
+    p.enriched = true;
+    p.enrichedAt = '2026-07-02T00:05:00Z';
+    return p;
+  });
+  const first = await refresh({ config, state });
+  expect(enrichPr).toHaveBeenCalledTimes(1);
+  expect(first.buckets.self_review[0]?.comments.map(c => c.body)).toEqual(['stale', 'same-second']);
+
+  // Now stamped minutes past updatedAt: the next refresh reuses it and carries
+  // the stamp forward, so the one-time re-fetch stays one-time.
+  vi.mocked(fetchPrs).mockResolvedValueOnce({ prs: [pr({ updatedAt: at })], errors: [] });
+  const second = await refresh({ config, state });
+  expect(enrichPr).toHaveBeenCalledTimes(1);
+  expect(second.buckets.self_review[0]?.comments).toHaveLength(2);
+  expect(state.lastPrs?.[0]?.enrichedAt).toBe('2026-07-02T00:05:00Z');
+});
+
+test('a last-known PR enriched before enrichedAt existed is re-enriched once rather than trusted', async () => {
+  const { fetchPrs, enrichPr } = await import('./github.ts');
+  const state = emptyState();
+  state.lastCards = [card()];
+  state.lastPrs = [pr({ enriched: true })];
+  vi.mocked(fetchPrs).mockResolvedValueOnce({ prs: [pr()], errors: [] });
+  vi.mocked(enrichPr).mockClear();
+  await refresh({ config, state });
+  expect(enrichPr).toHaveBeenCalledTimes(1);
+});
+
 // #69: a throttle that outlives gh()'s retries used to reach the banner as a raw
 // URL plus a JSON blob, which reads like an outage even though the board still
 // shows last-known-good data.

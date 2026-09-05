@@ -239,6 +239,17 @@ export function buildSnapshot({ cards, prs, state, config, errors, degradedPrRep
   };
 }
 
+// How close an enrichment may sit to the updatedAt it read before the
+// same-second hole (see the enrichment skip in refresh()) makes it
+// unconfirmed (#75). Two seconds covers the second-granularity rounding plus
+// clock skew between GitHub and this host.
+const UNCONFIRMED_ENRICHMENT_MS = 2_000;
+
+function enrichmentUnconfirmed(last: Pr): boolean {
+  if (!last.enrichedAt) return true;
+  return Date.parse(last.updatedAt) >= Date.parse(last.enrichedAt) - UNCONFIRMED_ENRICHMENT_MS;
+}
+
 // Concurrent refreshes (two browser tabs, the CLI, a writeback's post-write
 // refresh, the server's own timer) are serialized per State, and every caller
 // that arrives while one is in flight shares a single follow-up (#72). That
@@ -331,18 +342,31 @@ async function runRefresh({ config, state, quiet }: { config: Config; state: Sta
     const linked = linkPrsToCards(cards, prs, config.jira.projectKey);
     // Enrich only linked PRs that changed since the last refresh. GitHub bumps
     // a PR's updated_at for every comment, review, review request, push and
-    // label, so an unchanged updatedAt means last refresh's comments and
-    // review state still hold; CI arrives with discovery (mapPr) and is
-    // already fresh on the new object. This is what makes a quiet refresh
-    // cost one request per repo instead of three per linked PR (#72).
+    // label — and for an edit or deletion of an existing comment too (checked
+    // against the REST issues endpoint, 2026-09-05) — so an unchanged
+    // updatedAt means last refresh's comments and review state still hold;
+    // CI arrives with discovery (mapPr) and is already fresh on the new
+    // object. This is what makes a quiet refresh cost one request per repo
+    // instead of three per linked PR (#72).
+    //
+    // One hole in that equality (#75): the timestamps are whole seconds, so a
+    // comment that lands in the same second as the updatedAt an enrichment
+    // read leaves updatedAt equal while the comment list is stale, and
+    // nothing bumps it again until the next PR event, which on a quiet PR can
+    // be days. An enrichment recorded that close to the updatedAt it saw is
+    // therefore unconfirmed and is fetched once more; the re-fetch stamps an
+    // enrichedAt well past updatedAt, so the refresh after that reuses it as
+    // usual. A last-known PR with no enrichedAt at all (state written before
+    // the stamp existed) takes the same one-time re-fetch.
     const previous = new Map((state.lastPrs ?? []).map(p => [`${p.repo}#${p.number}`, p]));
     const toEnrich: Pr[] = [];
     for (const p of new Set(linked.values())) {
       const last = previous.get(`${p.repo}#${p.number}`);
-      if (!last?.enriched || last.updatedAt !== p.updatedAt) { toEnrich.push(p); continue; }
+      if (!last?.enriched || last.updatedAt !== p.updatedAt || enrichmentUnconfirmed(last)) { toEnrich.push(p); continue; }
       p.comments = last.comments;
       if (p.reviewState !== 'review_required') p.reviewState = last.reviewState;
       p.enriched = true;
+      p.enrichedAt = last.enrichedAt;
       reused++;
     }
     // Enrich in small batches to avoid GitHub's secondary rate limit. Each
