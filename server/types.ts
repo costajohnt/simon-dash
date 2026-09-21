@@ -226,6 +226,16 @@ export interface DoneCard {
   doneAt: string | null;
 }
 
+// A card this user reported (Jira reporter), any project, any status. Drives
+// the Filed page and its stat card; never enters the board buckets.
+export interface FiledCard {
+  key: string;
+  summary: string;
+  jiraStatus: string;
+  jiraUrl: string;
+  createdAt: string | null;
+}
+
 export interface ActivityEntry {
   type: 'merged' | 'closed' | 'comment';
   label: string;
@@ -260,6 +270,9 @@ export interface Snapshot {
   newlyDone: string[];
   recentActivity: ActivityEntry[];
   prLog: PrLogEntry[];
+  // Cards this user reported, newest first. Absent in snapshots persisted
+  // before the field existed; migrateSnapshot in state.ts backfills it.
+  filed: FiledCard[];
 }
 
 // --- Simon executor runs (/api/simon/*) ---
