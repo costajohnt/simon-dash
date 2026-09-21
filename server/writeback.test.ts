@@ -413,7 +413,7 @@ test('autoTransitionMergedCards: flag off (autoTransitionMerged: false) skips al
   const config = { ...baseAutoConfig, autoTransitionMerged: false };
   const state = stateWithMergedCard('PROJ-1');
   const transitionCardFn = vi.fn();
-  const result = await autoTransitionMergedCards({ config, state, transitionCardFn });
+  const result = await autoTransitionMergedCards({ state, loadConfigFn: () => config, transitionCardFn });
   expect(transitionCardFn).not.toHaveBeenCalled();
   expect(result).toEqual({ attempted: 0, succeeded: 0, failed: 0 });
 });
@@ -422,7 +422,7 @@ test('autoTransitionMergedCards: writeEnabled false skips all transitions', asyn
   const config = { ...baseAutoConfig, writeEnabled: false };
   const state = stateWithMergedCard('PROJ-1');
   const transitionCardFn = vi.fn();
-  const result = await autoTransitionMergedCards({ config, state, transitionCardFn });
+  const result = await autoTransitionMergedCards({ state, loadConfigFn: () => config, transitionCardFn });
   expect(transitionCardFn).not.toHaveBeenCalled();
   expect(result).toEqual({ attempted: 0, succeeded: 0, failed: 0 });
 });
@@ -431,7 +431,7 @@ test('autoTransitionMergedCards: demo mode skips all transitions', async () => {
   const config = { ...baseAutoConfig, demo: true };
   const state = stateWithMergedCard('PROJ-1');
   const transitionCardFn = vi.fn();
-  const result = await autoTransitionMergedCards({ config, state, transitionCardFn });
+  const result = await autoTransitionMergedCards({ state, loadConfigFn: () => config, transitionCardFn });
   expect(transitionCardFn).not.toHaveBeenCalled();
   expect(result).toEqual({ attempted: 0, succeeded: 0, failed: 0 });
 });
@@ -439,7 +439,7 @@ test('autoTransitionMergedCards: demo mode skips all transitions', async () => {
 test('autoTransitionMergedCards: card acked for merged_not_in_test is skipped', async () => {
   const state = stateWithMergedCard('PROJ-1', ['merged_not_in_test']);
   const transitionCardFn = vi.fn();
-  const result = await autoTransitionMergedCards({ config: baseAutoConfig, state, transitionCardFn });
+  const result = await autoTransitionMergedCards({ state, loadConfigFn: () => baseAutoConfig, transitionCardFn });
   expect(transitionCardFn).not.toHaveBeenCalled();
   expect(result).toEqual({ attempted: 0, succeeded: 0, failed: 0 });
 });
@@ -447,7 +447,7 @@ test('autoTransitionMergedCards: card acked for merged_not_in_test is skipped', 
 test('autoTransitionMergedCards: unacked card with merged_not_in_test is transitioned to inTest', async () => {
   const state = stateWithMergedCard('PROJ-1');
   const transitionCardFn = vi.fn().mockResolvedValue({ transitionedTo: 'In Test' });
-  const result = await autoTransitionMergedCards({ config: baseAutoConfig, state, transitionCardFn });
+  const result = await autoTransitionMergedCards({ state, loadConfigFn: () => baseAutoConfig, transitionCardFn });
   expect(transitionCardFn).toHaveBeenCalledOnce();
   expect(transitionCardFn).toHaveBeenCalledWith(baseAutoConfig.jira, 'PROJ-1', 'In Test');
   expect(result).toEqual({ attempted: 1, succeeded: 1, failed: 0 });
@@ -482,7 +482,7 @@ test('autoTransitionMergedCards: transition throwing is caught, other cards stil
     return Promise.resolve({ transitionedTo: 'In Test' });
   });
 
-  const result = await autoTransitionMergedCards({ config: baseAutoConfig, state, transitionCardFn });
+  const result = await autoTransitionMergedCards({ state, loadConfigFn: () => baseAutoConfig, transitionCardFn });
   expect(transitionCardFn).toHaveBeenCalledTimes(2);
   expect(result).toEqual({ attempted: 2, succeeded: 1, failed: 1 });
 });
@@ -490,7 +490,23 @@ test('autoTransitionMergedCards: transition throwing is caught, other cards stil
 test('autoTransitionMergedCards: null snapshot returns early without attempting transitions', async () => {
   const state = emptyState(); // snapshot is null
   const transitionCardFn = vi.fn();
-  const result = await autoTransitionMergedCards({ config: baseAutoConfig, state, transitionCardFn });
+  const result = await autoTransitionMergedCards({ state, loadConfigFn: () => baseAutoConfig, transitionCardFn });
+  expect(transitionCardFn).not.toHaveBeenCalled();
+  expect(result).toEqual({ attempted: 0, succeeded: 0, failed: 0 });
+});
+
+test('autoTransitionMergedCards: config re-read failure fails closed', async () => {
+  const state = stateWithMergedCard('PROJ-1');
+  const transitionCardFn = vi.fn();
+  const result = await autoTransitionMergedCards({ state, loadConfigFn: () => { throw new Error('ENOENT'); }, transitionCardFn });
+  expect(transitionCardFn).not.toHaveBeenCalled();
+  expect(result).toEqual({ attempted: 0, succeeded: 0, failed: 0 });
+});
+
+test('autoTransitionMergedCards: card outside the configured project is skipped', async () => {
+  const state = stateWithMergedCard('OTHER-1');
+  const transitionCardFn = vi.fn();
+  const result = await autoTransitionMergedCards({ state, loadConfigFn: () => baseAutoConfig, transitionCardFn });
   expect(transitionCardFn).not.toHaveBeenCalled();
   expect(result).toEqual({ attempted: 0, succeeded: 0, failed: 0 });
 });

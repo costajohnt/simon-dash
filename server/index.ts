@@ -306,7 +306,7 @@ export function createServer({ config, statePath, webDist, configPath, refreshFn
       // this outer try-catch guards against unexpected throws from the function
       // itself so the tick loop stays alive regardless.
       try {
-        await autoTransitionMergedCards({ config, state });
+        await autoTransitionMergedCards({ state, configPath });
       } catch (e) {
         console.error('auto-transition batch failed unexpectedly:', e);
       }
