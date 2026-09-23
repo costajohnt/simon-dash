@@ -19,11 +19,11 @@ test('ci failing -> needs_attention', () => {
 test('new PR comment by someone else -> attention reason without leaving its bucket', () => {
   const others = pr({ comments: [{ author: 'reviewer', body: 'x', createdAt: '2026-07-02T00:00:00Z' }] });
   const r = classifyCard({ ...base, card: card(), pr: others, cs: cs() });
-  expect(r.bucket).toBe('self_review');
+  expect(r.bucket).toBe('waiting_review');
   expect(r.attention).toContain('new_pr_comments');
   expect(r.newComments).toHaveLength(1);
   const mine = pr({ comments: [{ author: 'john', body: 'x', createdAt: '2026-07-02T00:00:00Z' }] });
-  expect(classifyCard({ ...base, card: card(), pr: mine, cs: cs() }).bucket).toBe('self_review');
+  expect(classifyCard({ ...base, card: card(), pr: mine, cs: cs() }).bucket).toBe('waiting_review');
 });
 
 test('merged but not In Test -> needs_attention; merged and In Test -> qa_ready', () => {
@@ -59,6 +59,14 @@ test('own Jira reply clears older third-party comments; later ones still flag', 
   // an ack newer than the reply still wins
   const acked = classifyCard({ ...base, card: card({ comments: [qa, mine, later] }), pr: null, cs: cs({ lastSeenJira: '2026-07-05T00:00:00Z' }) });
   expect(acked.attention).not.toContain('new_jira_comments');
+});
+
+// #90: clearing the Draft label is the operator's "out for peer review"
+// signal. A non-draft open PR with zero reviews and a non-review Jira status
+// belongs in Waiting in Review, not back in Self Review Needed.
+test('non-draft open PR with no reviews and In Progress status -> waiting_review', () => {
+  expect(classifyCard({ ...base, card: card({ status: 'In Progress' }), pr: pr({ isDraft: false, reviewState: 'none' }), cs: cs() }).bucket).toBe('waiting_review');
+  expect(classifyCard({ ...base, card: card({ status: 'In Progress' }), pr: pr({ isDraft: true, reviewState: 'none' }), cs: cs() }).bucket).toBe('self_review');
 });
 
 test('approved PR -> mergeable', () => {
@@ -148,7 +156,7 @@ test('degraded PR data mutes acked reasons without pruning them', () => {
   expect(r.bucket).toBe('in_progress');
   // healthy refresh, CI still failing: still muted
   const r2 = classifyCard({ ...base, card: card(), pr: pr({ ciStatus: 'failing' }), cs: c });
-  expect(r2.bucket).toBe('self_review');
+  expect(r2.bucket).toBe('waiting_review');
   expect(c.ackedReasons).toEqual(['ci_failing']);
 });
 
