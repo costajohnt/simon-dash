@@ -43,6 +43,24 @@ test('review_required -> waiting_review; no PR -> in_progress; todo helper', () 
   expect(isTodo(card({ status: 'To Do' }), statuses)).toBe(true);
 });
 
+// #85: replying on the tracker is the resolution of "somebody is waiting on
+// you". The developer's latest own comment acts as a watermark alongside the
+// explicit ack; a third-party comment after the reply flags again.
+test('own Jira reply clears older third-party comments; later ones still flag', () => {
+  const qa = { authorId: 'other', author: 'qa', body: 'question', createdAt: '2026-07-02T00:00:00Z' };
+  const mine = { authorId: 'me', author: 'john', body: 'answer', createdAt: '2026-07-03T00:00:00Z' };
+  const later = { authorId: 'other', author: 'qa', body: 'follow-up', createdAt: '2026-07-04T00:00:00Z' };
+  const replied = classifyCard({ ...base, card: card({ comments: [qa, mine] }), pr: null, cs: cs() });
+  expect(replied.attention).not.toContain('new_jira_comments');
+  expect(replied.newComments).toHaveLength(0);
+  const followUp = classifyCard({ ...base, card: card({ comments: [qa, mine, later] }), pr: null, cs: cs() });
+  expect(followUp.attention).toContain('new_jira_comments');
+  expect(followUp.newComments.map(c => c.body)).toEqual(['follow-up']);
+  // an ack newer than the reply still wins
+  const acked = classifyCard({ ...base, card: card({ comments: [qa, mine, later] }), pr: null, cs: cs({ lastSeenJira: '2026-07-05T00:00:00Z' }) });
+  expect(acked.attention).not.toContain('new_jira_comments');
+});
+
 test('approved PR -> mergeable', () => {
   expect(classifyCard({ ...base, card: card(), pr: pr({ reviewState: 'approved' }), cs: cs() }).bucket).toBe('mergeable');
 });
