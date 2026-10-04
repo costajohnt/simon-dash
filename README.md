@@ -94,6 +94,8 @@ launchctl load ~/Library/LaunchAgents/com.johncosta.simon-dash.plist
 
 Logs go to `~/Library/Logs/simon-dash.log` (not `/tmp`, which is world-readable and shared across users on the machine; server logs include every request path and Jira issue key). To unload: `launchctl unload ~/Library/LaunchAgents/com.johncosta.simon-dash.plist`.
 
+Restart behavior: the plist sets `KeepAlive` to `{ SuccessfulExit: false }`, so launchd restarts the server only when it exits with an error (a crash, a failed build), at most once every `ThrottleInterval` (30s). A clean exit is not respawned. That covers a `SIGTERM`/`SIGINT` shutdown (exit 0) and the case where a server is already running: `bin/start.sh` first checks `data/server.pid` (the same check the CLI and MCP use, `serverAppearsRunning()` in `server/transport.ts`, plus a probe of `/api/data` on the port that file records). If a simon-dash server is already up, for example one you started by hand, the script logs that and exits 0. It does not rebuild and then die on `EADDRINUSE` every 30 seconds. To hand control back to launchd after stopping a hand-started server, run `launchctl kickstart gui/$(id -u)/com.johncosta.simon-dash` (or unload and load the agent again).
+
 ## CLI
 
 `server/cli.ts` is a plain-TS, dependency-free CLI over the same modules the
