@@ -212,7 +212,7 @@ export function formatGithubStats(s: GithubRequestStats = githubStats()): string
 // linked; a long-lived server needs the size cap below.
 // ponytail: bulk-drop at the cap (one re-paid sweep), LRU if it ever matters.
 const ETAG_CACHE_MAX = 500;
-const etagCache = new Map<string, { etag: string; body: unknown }>();
+const etagCache = new Map<string, { etag: string; body: unknown; link: string | null }>();
 
 // GitHub's *secondary* rate limit is rate-shaped, not quota-shaped: it fires on
 // bursts and on many requests against one endpoint family in a short window, and
@@ -327,22 +327,55 @@ async function send(family: GithubRequestFamily, path: string, token: string,
   }
 }
 
-// REST GET through the ETag cache.
-async function gh<T>(family: GithubRequestFamily, path: string, token: string): Promise<T> {
+// REST GET through the ETag cache, with the response's Link header (cached
+// alongside the body, since a 304 carries no pagination of its own).
+async function ghPage<T>(family: GithubRequestFamily, path: string, token: string): Promise<{ body: T; link: string | null }> {
   const cached = etagCache.get(path);
   const res = await send(family, path, token, cached ? { headers: { 'If-None-Match': cached.etag } } : {});
   if (res.status === 304) {
     if (!cached) throw new Error(`GitHub 304 ${path}: no cached body`);
     stats.notModified++;
-    return cached.body as T;
+    return { body: cached.body as T, link: cached.link };
   }
   const body = await res.json() as T;
+  const link = res.headers?.get('link') ?? null;
   const etag = res.headers?.get('etag');
   if (etag) {
     if (etagCache.size >= ETAG_CACHE_MAX) etagCache.clear();
-    etagCache.set(path, { etag, body });
+    etagCache.set(path, { etag, body, link });
   }
-  return body;
+  return { body, link };
+}
+
+async function gh<T>(family: GithubRequestFamily, path: string, token: string): Promise<T> {
+  return (await ghPage<T>(family, path, token)).body;
+}
+
+// The page number of a Link header's rel="last" entry, or null when there is
+// only one page (GitHub omits rel="last" on the last page itself).
+export function lastPageFromLink(link: string | null | undefined): number | null {
+  for (const part of (link ?? '').split(',')) {
+    const m = part.match(/<([^>]+)>\s*;\s*rel="last"/);
+    if (!m) continue;
+    const page = Number(new URL(m[1]!, 'https://api.github.com').searchParams.get('page'));
+    return Number.isInteger(page) && page > 0 ? page : null;
+  }
+  return null;
+}
+
+// The issue-comments endpoint lists oldest first and ignores sort/direction,
+// so a thread over 100 comments (bot-heavy PRs) would hand back only the
+// oldest page and miss the newest human comments. Fetch page 1 (which says
+// how many pages there are), then the last page and the one before it, so
+// the newest 100-200 comments are always in hand. Costs one request up to
+// 100 comments, two up to 200, three beyond.
+async function newestIssueComments(path: string, token: string): Promise<RawComment[]> {
+  const first = await ghPage<RawComment[]>('issue_comments', `${path}?per_page=100`, token);
+  const last = lastPageFromLink(first.link);
+  if (!last || last < 2) return first.body;
+  const pages = last === 2 ? [2] : [last - 1, last];
+  const rest = await Promise.all(pages.map(n => gh<RawComment[]>('issue_comments', `${path}?per_page=100&page=${n}`, token)));
+  return [...(last === 2 ? first.body : []), ...rest.flat()];
 }
 
 interface GqlResponse<T> { data?: T | null; errors?: { message?: string }[] }
@@ -423,11 +456,13 @@ export async function fetchPrs(cfg: GithubConfig): Promise<{ prs: Pr[]; errors: 
 export async function enrichPr(pr: Pr, cfg: GithubConfig): Promise<Pr> {
   const [owner, repo] = pr.repo.split('/');
   const base = `/repos/${owner}/${repo}`;
-  // sort=created&direction=desc so a >100-comment thread keeps the newest
-  // comments (the ones that matter for attention) instead of silently
-  // truncating to the oldest page. The reviews endpoint is left as-is.
+  // Review comments take sort=created&direction=desc so a >100-comment thread
+  // keeps the newest comments (the ones that matter for attention) instead of
+  // silently truncating to the oldest page. Issue comments ignore those
+  // parameters, so newestIssueComments pages to the end instead. The reviews
+  // endpoint is left as-is.
   const [issueComments, reviewComments, reviews] = await Promise.all([
-    gh<RawComment[]>('issue_comments', `${base}/issues/${pr.number}/comments?per_page=100&sort=created&direction=desc`, cfg.token),
+    newestIssueComments(`${base}/issues/${pr.number}/comments`, cfg.token),
     gh<RawComment[]>('review_comments', `${base}/pulls/${pr.number}/comments?per_page=100&sort=created&direction=desc`, cfg.token),
     gh<RawReview[]>('reviews', `${base}/pulls/${pr.number}/reviews?per_page=100`, cfg.token),
   ]);

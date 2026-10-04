@@ -1,5 +1,5 @@
 import { test, expect, vi, afterEach } from 'vitest';
-import { mapPr, newCiFailures, ciBaseVerdict, ciFromRollup, reviewStateFrom, fetchPrs, enrichPr, throttleWaitMs, isThrottleMessage, githubStats, resetGithubStats, resetGithubRateLimit } from './github.ts';
+import { mapPr, newCiFailures, ciBaseVerdict, ciFromRollup, reviewStateFrom, fetchPrs, enrichPr, throttleWaitMs, isThrottleMessage, githubStats, resetGithubStats, resetGithubRateLimit, lastPageFromLink } from './github.ts';
 import { classifyCard } from './classify.ts';
 import type { Pr, GithubConfig, Card, CardState } from './types.ts';
 
@@ -104,6 +104,55 @@ test('enrichPr merges issue comments, review comments, and review bodies into on
   expect(fetchMock).toHaveBeenCalledTimes(3);
   expect(result.reviewState).toBe('approved');
   expect(result.enriched).toBe(true);
+});
+
+test('lastPageFromLink reads rel="last", and none means a single page', () => {
+  expect(lastPageFromLink('<https://api.github.com/repositories/1/issues/5/comments?per_page=100&page=2>; rel="next", <https://api.github.com/repositories/1/issues/5/comments?per_page=100&page=4>; rel="last"')).toBe(4);
+  expect(lastPageFromLink('<https://api.github.com/x?page=1>; rel="prev", <https://api.github.com/x?page=1>; rel="first"')).toBeNull();
+  expect(lastPageFromLink(null)).toBeNull();
+});
+
+// L2 (audit 2026-10-04): issue comments ignore sort/direction, so >100
+// comments used to return only the oldest 100.
+test('enrichPr fetches the newest issue comments on a thread longer than one page', async () => {
+  const pages: Record<string, { body: unknown[]; link?: string }> = {};
+  const comment = (n: number) => ({ user: { login: n === 350 ? 'human' : 'bot' }, body: `c${n}`, created_at: new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString() });
+  const page = (n: number) => Array.from({ length: n === 4 ? 50 : 100 }, (_, i) => comment((n - 1) * 100 + i + 1));
+  const lastLink = '<https://api.github.com/repositories/9/issues/5/comments?per_page=100&page=4>; rel="last"';
+  pages['/repos/lp-org/lp-repo/issues/5/comments?per_page=100'] = { body: page(1), link: lastLink };
+  pages['/repos/lp-org/lp-repo/issues/5/comments?per_page=100&page=3'] = { body: page(3) };
+  pages['/repos/lp-org/lp-repo/issues/5/comments?per_page=100&page=4'] = { body: page(4) };
+  const fetchMock = vi.fn((url: string | URL) => {
+    const path = String(url).replace('https://api.github.com', '');
+    const hit = pages[path];
+    const body = hit?.body ?? [];
+    return Promise.resolve({ ok: true, status: 200, headers: headers(hit?.link ? { link: hit.link } : {}), json: () => Promise.resolve(body) });
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  resetGithubStats();
+  const pr = await enrichPr(basePr({ repo: 'lp-org/lp-repo', number: 5 }), { token: 't', org: 'lp-org', repos: [], username: 'me' });
+  // Pages 3 and 4: the newest 150 of 350, including the newest human comment.
+  expect(pr.comments).toHaveLength(150);
+  expect(pr.comments.at(-1)).toMatchObject({ author: 'human', body: 'c350' });
+  expect(pr.comments[0]?.body).toBe('c201');
+  expect(githubStats().byFamily.issue_comments).toBe(3);
+  expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/issues/5/comments') && String(u).includes('sort='))).toBe(false);
+});
+
+test('enrichPr keeps both pages of a two-page issue-comment thread, at one extra request', async () => {
+  const comment = (n: number) => ({ user: { login: 'u' }, body: `c${n}`, created_at: new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString() });
+  const fetchMock = vi.fn((url: string | URL) => {
+    const u = String(url);
+    const body = u.endsWith('/issues/6/comments?per_page=100') ? Array.from({ length: 100 }, (_, i) => comment(i + 1))
+      : u.endsWith('/issues/6/comments?per_page=100&page=2') ? [comment(101)] : [];
+    const link = u.endsWith('/issues/6/comments?per_page=100') ? '<https://api.github.com/x?per_page=100&page=2>; rel="next", <https://api.github.com/x?per_page=100&page=2>; rel="last"' : null;
+    return Promise.resolve({ ok: true, status: 200, headers: headers(link ? { link } : {}), json: () => Promise.resolve(body) });
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  resetGithubStats();
+  const pr = await enrichPr(basePr({ repo: 'lp-org/lp-two', number: 6 }), { token: 't', org: 'lp-org', repos: [], username: 'me' });
+  expect(pr.comments).toHaveLength(101);
+  expect(githubStats().byFamily.issue_comments).toBe(2);
 });
 
 test('enrichPr keeps a pending review request ahead of an older approval', async () => {
