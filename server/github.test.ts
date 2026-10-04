@@ -1,5 +1,5 @@
 import { test, expect, vi, afterEach } from 'vitest';
-import { mapPr, newCiFailures, ciBaseVerdict, ciFromRollup, reviewStateFrom, fetchPrs, enrichPr, throttleWaitMs, isThrottleMessage, githubStats, resetGithubStats } from './github.ts';
+import { mapPr, newCiFailures, ciBaseVerdict, ciFromRollup, reviewStateFrom, fetchPrs, enrichPr, throttleWaitMs, isThrottleMessage, githubStats, resetGithubStats, resetGithubRateLimit } from './github.ts';
 import { classifyCard } from './classify.ts';
 import type { Pr, GithubConfig, Card, CardState } from './types.ts';
 
@@ -313,6 +313,99 @@ test('gh gives up after the retry budget, and a non-throttle 403 is not retried 
     await vi.runAllTimersAsync();
     expect((await bad).errors[0]).toContain('Bad credentials');
     expect(badToken).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// M2 (audit 2026-10-04): the per-wait cap alone let an exhausted primary
+// limit block fetchPrs over 3 repos for 9 simulated minutes.
+test('an exhausted primary limit with a far reset fails this and later requests fast, without waiting', async () => {
+  vi.useFakeTimers();
+  try {
+    const exhausted = vi.fn(() => Promise.resolve({
+      ok: false, status: 403,
+      headers: headers({ 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(Date.now() / 1000) + 3600) }),
+      text: () => Promise.resolve('{ "message": "API rate limit exceeded for user." }'),
+    }));
+    vi.stubGlobal('fetch', exhausted);
+    resetGithubStats();
+    const start = Date.now();
+    const pending = fetchPrs({ token: 't', org: 'o', repos: ['rl-a', 'rl-b', 'rl-c'], username: 'me' });
+    await vi.runAllTimersAsync();
+    const { errors } = await pending;
+    // One request reached GitHub; the other repos failed without a fetch.
+    expect(exhausted).toHaveBeenCalledTimes(1);
+    expect(Date.now() - start).toBe(0);
+    expect(errors).toHaveLength(3);
+    expect(errors.every(e => isThrottleMessage(e))).toBe(true);
+    // The marker outlives the refresh until the reset passes...
+    resetGithubStats();
+    const later = await fetchPrs({ token: 't', org: 'o', repos: ['rl-a'], username: 'me' });
+    expect(later.errors[0]).toMatch(/rate limit exceeded until/);
+    expect(exhausted).toHaveBeenCalledTimes(1);
+  } finally {
+    resetGithubRateLimit();
+    vi.useRealTimers();
+  }
+});
+
+test('the GraphQL rate-limit marker does not block REST, and clears once the reset passes', async () => {
+  vi.useFakeTimers();
+  try {
+    const reset = Math.floor(Date.now() / 1000) + 600;
+    let graphqlCalls = 0;
+    vi.stubGlobal('fetch', vi.fn((url: string | URL) => {
+      if (String(url).endsWith('/graphql')) {
+        graphqlCalls++;
+        return Promise.resolve({ ok: false, status: 403, headers: headers({ 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(reset) }),
+          text: () => Promise.resolve('{ "message": "API rate limit exceeded" }') });
+      }
+      return Promise.resolve({ ok: true, status: 200, headers: headers(), json: () => Promise.resolve([]) });
+    }));
+    resetGithubStats();
+    expect((await fetchPrs({ token: 't', org: 'o', repos: ['gq-a', 'gq-b'], username: 'me' })).errors).toHaveLength(2);
+    expect(graphqlCalls).toBe(1);
+    // REST is a separate budget: enrichment still goes out.
+    const pr = await enrichPr(basePr({ repo: 'o/gq-a', number: 2 }), { token: 't', org: 'o', repos: [], username: 'me' });
+    expect(pr.enriched).toBe(true);
+    // Past the reset, GraphQL is tried again.
+    await vi.advanceTimersByTimeAsync(601_000);
+    // (The stub still answers with the old, now-past reset, so this one
+    // backs off briefly rather than failing fast.)
+    const retried = fetchPrs({ token: 't', org: 'o', repos: ['gq-a'], username: 'me' });
+    await vi.runAllTimersAsync();
+    await retried;
+    expect(graphqlCalls).toBeGreaterThan(1);
+  } finally {
+    resetGithubRateLimit();
+    vi.useRealTimers();
+  }
+});
+
+test('total throttle backoff in one refresh is capped by a budget, then requests fail fast', async () => {
+  vi.useFakeTimers();
+  try {
+    // A secondary limit that always asks for the full capped wait.
+    const throttled = vi.fn(() => Promise.resolve(
+      { ok: false, status: 429, headers: headers({ 'retry-after': '60' }), text: () => Promise.resolve(SECONDARY) }));
+    vi.stubGlobal('fetch', throttled);
+    resetGithubStats();
+    const start = Date.now();
+    const pending = fetchPrs({ token: 't', org: 'o', repos: ['budget-a', 'budget-b', 'budget-c'], username: 'me' });
+    await vi.runAllTimersAsync();
+    const { errors } = await pending;
+    expect(errors).toHaveLength(3);
+    // Without the budget: 3 repos x 3 waits x 60s = 9 minutes. With it, one
+    // 60s wait fits in the 90s budget, and every later throttle fails at once.
+    expect(Date.now() - start).toBe(60_000);
+    expect(throttled).toHaveBeenCalledTimes(4);
+    // A new refresh gets a new budget.
+    resetGithubStats();
+    const again = fetchPrs({ token: 't', org: 'o', repos: ['budget-a'], username: 'me' });
+    await vi.runAllTimersAsync();
+    await again;
+    expect(throttled).toHaveBeenCalledTimes(6);
   } finally {
     vi.useRealTimers();
   }

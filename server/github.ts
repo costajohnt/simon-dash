@@ -191,7 +191,9 @@ export interface GithubRequestStats {
 const freshStats = (): GithubRequestStats =>
   ({ requests: 0, byFamily: {}, notModified: 0, retries: 0, rateLimitRemaining: { rest: null, graphql: null } });
 let stats = freshStats();
-export function resetGithubStats(): void { stats = freshStats(); }
+// refresh() calls this at entry, so it also opens a fresh throttle wait budget
+// for the sweep (see THROTTLE_BUDGET_MS).
+export function resetGithubStats(): void { stats = freshStats(); throttleBudgetMs = THROTTLE_BUDGET_MS; }
 export function githubStats(): GithubRequestStats {
   return { ...stats, byFamily: { ...stats.byFamily }, rateLimitRemaining: { ...stats.rateLimitRemaining } };
 }
@@ -224,6 +226,29 @@ const THROTTLE_RETRIES = 3;
 // hour away, and a refresh that blocks that long is worse than a degraded one
 // that falls back to last-known-good data and retries on the next tick.
 const MAX_THROTTLE_WAIT_MS = 60_000;
+// The per-wait cap alone still let one sweep block for minutes: every request
+// could wait the cap three times over. This is the total backoff one refresh
+// (one resetGithubStats) may spend across all its requests, parallel waits
+// counted separately; past it, a throttled request fails at once and the
+// refresh degrades to last-known-good data.
+const THROTTLE_BUDGET_MS = 90_000;
+let throttleBudgetMs = THROTTLE_BUDGET_MS;
+// When a response shows the primary limit exhausted with its reset further
+// off than one capped wait, no backoff can help: until that reset, every
+// request against the same budget (REST and GraphQL are separate) fails
+// without touching the network. Module-level, so it spans refreshes.
+const rateLimitedUntil: Record<'rest' | 'graphql', number> = { rest: 0, graphql: 0 };
+export function resetGithubRateLimit(): void { rateLimitedUntil.rest = 0; rateLimitedUntil.graphql = 0; }
+
+// The x-ratelimit-reset (epoch ms) of a primary-limit-exhausted throttle
+// whose reset is too far away to wait for, else null.
+function exhaustedUntil(res: { status: number; headers?: { get(name: string): string | null } }, now: number): number | null {
+  if (res.status !== 403 && res.status !== 429) return null;
+  if (res.headers?.get('x-ratelimit-remaining') !== '0') return null;
+  const reset = Number(res.headers?.get('x-ratelimit-reset'));
+  if (!Number.isFinite(reset)) return null;
+  return reset * 1000 - now > MAX_THROTTLE_WAIT_MS ? reset * 1000 : null;
+}
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -269,7 +294,12 @@ export const isThrottleMessage = (msg: string | undefined): boolean =>
 // the response for the caller to read (a 304 is a success here, not an error).
 async function send(family: GithubRequestFamily, path: string, token: string,
   init: { method?: 'POST'; body?: string; headers?: Record<string, string> } = {}): Promise<Response> {
+  const bucket = family === 'graphql' ? 'graphql' : 'rest';
   for (let attempt = 0; ; attempt++) {
+    // Message names the rate limit, so isThrottleMessage still recognises it.
+    if (Date.now() < rateLimitedUntil[bucket]) {
+      throw new Error(`GitHub API rate limit exceeded until ${new Date(rateLimitedUntil[bucket]).toISOString()} (${bucket}); not sent: ${path}`);
+    }
     stats.requests++;
     stats.byFamily[family] = (stats.byFamily[family] ?? 0) + 1;
     if (attempt > 0) stats.retries++;
@@ -282,11 +312,14 @@ async function send(family: GithubRequestFamily, path: string, token: string,
     // Optional chain: test stubs (and any minimal fetch shim) may return a
     // response without a headers object.
     const remaining = Number(res.headers?.get('x-ratelimit-remaining'));
-    if (Number.isFinite(remaining)) stats.rateLimitRemaining[family === 'graphql' ? 'graphql' : 'rest'] = remaining;
+    if (Number.isFinite(remaining)) stats.rateLimitRemaining[bucket] = remaining;
     if (res.ok || res.status === 304) return res;
     const text = await res.text();
-    const wait = attempt < THROTTLE_RETRIES ? throttleWaitMs(res, text, attempt) : null;
-    if (wait !== null) {
+    const until = exhaustedUntil(res, Date.now());
+    if (until !== null) rateLimitedUntil[bucket] = Math.max(rateLimitedUntil[bucket], until);
+    const wait = attempt < THROTTLE_RETRIES && until === null ? throttleWaitMs(res, text, attempt) : null;
+    if (wait !== null && wait <= throttleBudgetMs) {
+      throttleBudgetMs -= wait;
       await sleep(wait);
       continue;
     }
