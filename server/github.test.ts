@@ -1,6 +1,7 @@
 import { test, expect, vi, afterEach } from 'vitest';
-import { mapPr, newCiFailures, ciFromRollup, reviewStateFrom, fetchPrs, enrichPr, throttleWaitMs, isThrottleMessage, githubStats, resetGithubStats } from './github.ts';
-import type { Pr, GithubConfig } from './types.ts';
+import { mapPr, newCiFailures, ciBaseVerdict, ciFromRollup, reviewStateFrom, fetchPrs, enrichPr, throttleWaitMs, isThrottleMessage, githubStats, resetGithubStats } from './github.ts';
+import { classifyCard } from './classify.ts';
+import type { Pr, GithubConfig, Card, CardState } from './types.ts';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -369,6 +370,49 @@ test('newCiFailures: base has pending StatusContext -> undefined', () => {
 test('newCiFailures: failing head check absent from base rollup entirely -> undefined', () => {
   // base ran different checks; head failure has no base verdict yet
   expect(newCiFailures(rollup({ 'new-check': 'FAILURE' }), rollup({ 'other-check': 'SUCCESS' }))).toBeUndefined();
+});
+
+test('ciBaseVerdict marks only a still-running base as pending', () => {
+  const running = { state: 'PENDING', contexts: { nodes: [{ name: 'test', conclusion: null as string | null }] } };
+  expect(ciBaseVerdict(rollup({ test: 'FAILURE' }), running)).toEqual({ basePending: true });
+  // The rollup's own PENDING state counts even when the node for the failing
+  // head check has not appeared on base yet.
+  expect(ciBaseVerdict(rollup({ test: 'FAILURE' }), { ...rollup({ lint: 'SUCCESS' }), state: 'PENDING' })).toEqual({ basePending: true });
+  // Missing base data, or a check absent from a finished base: unknown, not pending.
+  expect(ciBaseVerdict(rollup({ test: 'FAILURE' }), null)).toEqual({ basePending: false });
+  expect(ciBaseVerdict(rollup({ 'new-check': 'FAILURE' }), rollup({ other: 'SUCCESS' }))).toEqual({ basePending: false });
+  expect(ciBaseVerdict(rollup({ test: 'FAILURE' }), rollup({ test: 'FAILURE' }))).toEqual({ newFailures: [], basePending: false });
+});
+
+// H2 (audit 2026-10-04): the #89 tests only checked the helper, so the board
+// still flagged a pre-existing failure for the whole base run. End to end:
+const statuses = { todo: 'To Do', inTest: 'In Test', done: 'Done', canceled: 'Canceled' };
+const jiraCard: Card = { key: 'PROJ-1', status: 'In Progress', myAccountId: 'me', comments: [], summary: '', description: '', url: '', createdAt: null, updatedAt: null };
+const cardState: CardState = { lastSeenPr: null, lastSeenJira: null, override: null, overrideAt: null };
+const classifyNode = (baseRollup: unknown) => classifyCard({
+  card: jiraCard, cs: cardState, statuses, username: 'me',
+  pr: mapPr(gqlPr({
+    commits: { nodes: [{ commit: { statusCheckRollup: rollup({ test: 'FAILURE' }) } }] },
+    baseRef: { target: { statusCheckRollup: baseRollup as never } },
+  }), 'o/r'),
+});
+
+test('mapPr -> classifyCard: a failure already red on a finished base does not flag', () => {
+  const r = classifyNode(rollup({ test: 'FAILURE' }));
+  expect(r.attention).not.toContain('ci_failing');
+  expect(r.bucket).toBe('waiting_review');
+});
+
+test('mapPr -> classifyCard: a still-running base does not flag', () => {
+  const r = classifyNode({ state: 'PENDING', contexts: { nodes: [{ name: 'test', conclusion: null }] } });
+  expect(r.attention).not.toContain('ci_failing');
+  expect(r.bucket).toBe('waiting_review');
+});
+
+test('mapPr -> classifyCard: a new failure on a finished base, or no base data, still flags', () => {
+  expect(classifyNode(rollup({ test: 'SUCCESS' })).attention).toContain('ci_failing');
+  expect(classifyNode(null).attention).toContain('ci_failing');
+  expect(classifyNode(null).bucket).toBe('needs_attention');
 });
 
 test('mapPr sets ciNewFailures only on an open failing PR', () => {

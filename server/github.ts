@@ -86,24 +86,32 @@ function rollupHasPending(rollup: GqlRollup | null | undefined): boolean {
   });
 }
 
-// The PR's failed checks minus the ones already failing on its base branch
-// (#79): [] means every failure is pre-existing, so the PR did not break CI.
-// undefined means "cannot tell" and callers keep flagging: base data missing
-// (branch deleted), base rollup still running (#86), or a failing head check
-// absent from the base rollup entirely (no verdict yet on base).
+// What the base branch says about the PR's failed checks (#79, #86).
+// newFailures: the PR's failed checks minus the ones already failing on its
+// base branch; [] means every failure is pre-existing, so the PR did not
+// break CI. undefined means "cannot tell". basePending separates the two
+// kinds of "cannot tell":
+// - basePending: the base rollup is still running, so its verdict is not in
+//   yet. Callers must not flag on this (#86): refresh carries the previous
+//   verdict over, and classify suppresses when there is none.
+// - otherwise: base data is missing (branch deleted, contexts not returned)
+//   or a failing head check never ran on a finished base. Callers keep
+//   flagging, as before #89.
 // ponytail: compares against the base branch tip, not the merge-base commit;
 // fetch the merge-base's checks if a since-fixed base keeps hiding nothing.
-export function newCiFailures(head: GqlRollup | null | undefined, base: GqlRollup | null | undefined): string[] | undefined {
+export function ciBaseVerdict(head: GqlRollup | null | undefined, base: GqlRollup | null | undefined): { newFailures?: string[]; basePending: boolean } {
   const headFailed = failedChecks(head);
   const baseFailed = failedChecks(base);
-  if (!headFailed?.length || !baseFailed) return undefined;
+  if (!headFailed?.length || !baseFailed) return { basePending: false };
 
   // Base is still running: rollup is incomplete, so zero base failures does
-  // not mean the base is green. Suppress rather than assert (#86).
-  if (rollupHasPending(base)) return undefined;
+  // not mean the base is green. Suppress rather than assert (#86). The
+  // rollup's own state counts too: a check queued on base may not have a
+  // context node yet.
+  if (rollupHasPending(base) || ciFromRollup(base?.state) === 'pending') return { basePending: true };
 
-  // If a failing head check is absent from the base rollup entirely, the base
-  // has produced no verdict for that check yet — treat as unknown (#86).
+  // If a failing head check is absent from a finished base rollup, there is
+  // no base verdict for it to compare against: unknown, keep flagging.
   const baseNodes = base?.contexts?.nodes;
   const baseNames = new Set(
     (baseNodes ?? []).flatMap(c => {
@@ -111,9 +119,13 @@ export function newCiFailures(head: GqlRollup | null | undefined, base: GqlRollu
       return n ? [n] : [];
     })
   );
-  if (headFailed.some(n => !baseNames.has(n))) return undefined;
+  if (headFailed.some(n => !baseNames.has(n))) return { basePending: false };
 
-  return headFailed.filter(n => !baseFailed.includes(n));
+  return { newFailures: headFailed.filter(n => !baseFailed.includes(n)), basePending: false };
+}
+
+export function newCiFailures(head: GqlRollup | null | undefined, base: GqlRollup | null | undefined): string[] | undefined {
+  return ciBaseVerdict(head, base).newFailures;
 }
 
 export function mapPr(node: GqlPr, repo: string): Pr {
@@ -122,6 +134,7 @@ export function mapPr(node: GqlPr, repo: string): Pr {
   const headRollup = node.commits?.nodes?.[0]?.commit?.statusCheckRollup;
   const rollup = headRollup?.state;
   const ciStatus = state === 'open' ? ciFromRollup(rollup) : 'unknown';
+  const verdict = ciStatus === 'failing' ? ciBaseVerdict(headRollup, node.baseRef?.target?.statusCheckRollup) : null;
   return {
     repo,
     number: node.number,
@@ -136,7 +149,8 @@ export function mapPr(node: GqlPr, repo: string): Pr {
     closedAt: node.closedAt ?? null,
     // A closed PR's checks are history, not status: keep the pre-#72 'unknown'.
     ciStatus,
-    ...(ciStatus === 'failing' ? { ciNewFailures: newCiFailures(headRollup, node.baseRef?.target?.statusCheckRollup) } : {}),
+    ...(verdict ? { ciNewFailures: verdict.newFailures } : {}),
+    ...(verdict?.basePending ? { ciBasePending: true } : {}),
     // Pending review requests are visible at discovery; approvals and change
     // requests need the reviews list, which enrichPr fetches for linked PRs.
     reviewState: (node.reviewRequests?.totalCount ?? 0) > 0 ? 'review_required' : 'none',
@@ -326,7 +340,7 @@ const PR_SEARCH = `query($q: String!) {
         labels(first: 10) { nodes { name } }
         reviewRequests(first: 1) { totalCount }
         commits(last: 1) { nodes { commit { statusCheckRollup { state ...Checks } } } }
-        baseRef { target { ... on Commit { statusCheckRollup { ...Checks } } } }
+        baseRef { target { ... on Commit { statusCheckRollup { state ...Checks } } } }
       }
     }
   }
