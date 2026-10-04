@@ -196,11 +196,11 @@ test('sequential POSTs both persist (no lost update)', async () => {
 // visible board rather than a 400.
 test('POST /api/action on an unknown key is a no-op that still succeeds', async () => {
   const res = await fetch(`${base}/api/action`, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type: 'ack', key: 'DOES-NOT-EXIST' }) });
+    body: JSON.stringify({ type: 'ack', key: 'NOPE-404' }) });
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ ok: true, bucket: null });
   const { loadState: loadStateFn } = await import('./state.ts');
-  expect(loadStateFn(statePath).cards['DOES-NOT-EXIST']!.lastSeenJira).not.toBeNull();
+  expect(loadStateFn(statePath).cards['NOPE-404']!.lastSeenJira).not.toBeNull();
 });
 
 test('POST /api/action with an unrecognized type returns 400', async () => {
@@ -376,7 +376,7 @@ test('POST /api/* with correct Content-Type and Host passes the guard (reaches n
   // 415/403), proving the guard itself isn't what's blocking them.
   const actionRes = await fetch(`${base}/api/action`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type: 'ack', key: 'GUARD-TEST' }),
+    body: JSON.stringify({ type: 'ack', key: 'GUARD-1' }),
   });
   expect(actionRes.status).toBe(200);
 

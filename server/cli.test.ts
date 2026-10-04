@@ -149,9 +149,9 @@ test('move --json in direct mode reports the resulting bucket', async () => {
 
 test('ack on an unknown key is a no-op that still exits 0', async () => {
   const statePath = tempStatePath();
-  const { code, out } = await run(['ack', 'GHOST'], { config, statePath });
+  const { code, out } = await run(['ack', 'GHOST-1'], { config, statePath });
   expect(code).toBe(0);
-  expect(out).toBe('GHOST: not currently on the board');
+  expect(out).toBe('GHOST-1: not currently on the board');
 });
 
 test('move with an invalid bucket exits 1 with the server-side error', async () => {
