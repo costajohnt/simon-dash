@@ -119,7 +119,10 @@ node server/cli.ts open                  # open the dashboard in your browser
 node server/cli.ts transition PROJ-123 "In Review"
 node server/cli.ts comment PROJ-123 "picking this back up today"
 node server/cli.ts pr-comment acme/webapp#482 "looks good, one nit inline"
+node server/cli.ts pr-comment webapp#482 "bare repo names use github.org from config.json"
 ```
+
+For `transition`/`comment`/`pr-comment`, everything after the key or PR ref is taken verbatim as the text (so `--json` or `-x` inside a comment is kept). Put flags before the key; a single trailing `--json` is still read as the flag, and `--` before the text disables that.
 
 Also runnable as `npm run cli -- status`, or (once linked/installed) as the
 `simon-dash` bin.
@@ -173,7 +176,7 @@ simon-dash can optionally *write* to Jira and GitHub — transition a card's sta
 - The dashboard web UI itself stays entirely read-only — there is no write-back UI in the SPA. Comments are only ever posted by an explicit CLI command (`comment`/`pr-comment`) or an explicit MCP tool call, and manual transitions the same way (`transition`/`transition_card`). Those require you (or, for MCP, a Claude session you're actively steering) to trigger them on purpose.
 - **The one automatic write is opt-in:** `"autoTransitionMerged": true` (default `false`). With it on, the server's scheduled refresh loop moves cards flagged `merged_not_in_test` (linked PR merged, card not yet In Test or Done) to the configured In Test status (`jira.statuses.inTest`). It never comments and never writes to GitHub. It writes nothing unless `writeEnabled` is also `true`. It re-reads `config.json` every tick with the same fail-closed rule as every other write, refuses in demo mode, stays inside `jira.projectKey`, and skips cards whose `merged_not_in_test` flag you have acked. It is also guarded against moving cards it should not:
   - It skips the whole batch when that refresh's Jira or GitHub data is degraded (`errors.jira`/`errors.github` set, so the board is showing last-known data).
-  - It only moves cards out of a review or in-progress status. A To Do card, or one already past In Test (e.g. "Ready for Release"), is left alone.
+  - It only moves cards out of a review or in-progress status. A To Do card, or one already past In Test (e.g. "Ready for Release"), is left alone. The in-progress status is "In Progress" by default; set `jira.statuses.inProgress` if your project renamed it, or those cards are never flagged or moved.
   - It fires at most once per merged PR. A failed attempt is not retried every tick.
   - It never re-flags a card that QA sent back after the card had reached In Test.
 

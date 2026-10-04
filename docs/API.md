@@ -139,7 +139,7 @@ Keys in `config.json` that change what reaches Jira or GitHub, all re-read from 
 - `demo` (default `false`): when `true`, every write is a stub success and nothing is written, regardless of `writeEnabled`.
 - `autoTransitionMerged` (default `false`): opt-in automatic transitions. After each scheduled refresh tick (the server's own loop, not `POST /api/refresh`), `autoTransitionMergedCards()` in `server/writeback.ts` moves cards flagged `merged_not_in_test` to `jira.statuses.inTest`. It does not go through this endpoint: it calls the Jira transition directly so the write doesn't trigger a second refresh. It shares this endpoint's gates. It does nothing unless `writeEnabled` is `true`, refuses in demo mode, and only touches keys inside `jira.projectKey`. It also skips cards whose `merged_not_in_test` reason is acked. Further guards:
   - It skips the batch when the refresh's data is degraded (`errors.jira` or `errors.github` set).
-  - It only moves a card out of a review or in-progress status, never out of To Do or a status past In Test.
+  - It only moves a card out of a review or in-progress status (`jira.statuses.inProgress`, default "In Progress", or the review status), never out of To Do or a status past In Test.
   - It fires at most once per merged PR. Failures are remembered rather than retried every tick.
   - It never re-flags a card that QA sent back after the card had reached In Test.
 
@@ -254,10 +254,10 @@ The full snapshot returned by `/api/refresh` and (once populated) `/api/data`:
 `PrRef` (a trimmed view of the linked PR, `null` if the card has no linked PR):
 
 ```
-{ repo: string, number: number, url: string, branch: string, state: 'open' | 'merged' | 'closed', ciStatus: 'passing' | 'failing' | 'pending' | 'unknown', reviewState: 'review_required' | 'changes_requested' | 'approved' | 'none', ciNewFailures?: string[], isDraft?: boolean }
+{ repo: string, number: number, url: string, branch: string, state: 'open' | 'merged' | 'closed', ciStatus: 'passing' | 'failing' | 'pending' | 'unknown', reviewState: 'review_required' | 'changes_requested' | 'approved' | 'none', ciNewFailures?: string[], ciBasePending?: boolean, isDraft?: boolean }
 ```
 
-`ciNewFailures` is present only while `ciStatus` is `'failing'`: the failed checks that are not also failing on the PR's base branch. `[]` means every failure is pre-existing on the base, so the card gets no `ci_failing` reason; absent means the comparison was not possible and the card is flagged as before.
+`ciNewFailures` is present only while `ciStatus` is `'failing'`: the failed checks that are not also failing on the PR's base branch. `[]` means every failure is pre-existing on the base, so the card gets no `ci_failing` reason; absent means the comparison was not possible and the card is flagged as before, unless `ciBasePending` is `true`: the base branch's CI is still running, so the verdict is unknown and the card is not flagged (refresh carries over the previous verdict for the same PR when it has one). The board shows such a PR as "CI red, base running".
 
 `isDraft` is `true` for a GitHub draft PR and for a PR carrying a `Draft` label (how Simon marks the PRs it opens). An open draft routes the card to `self_review` unless the card is in a review status, and never to `mergeable`.
 
@@ -293,7 +293,7 @@ There is no Merged or Closed page/counter/field. A merged PR surfaces only on it
 { key: string, summary: string, jiraStatus: string, jiraUrl: string, createdAt: string | null }
 ```
 
-Every card whose Jira **reporter** is the configured `accountId`, site-wide (not limited to `projectKey`) and in any status, ordered by `created` descending. A second JQL query per refresh; if it fails, the previous snapshot's list is kept and the failure is appended to `errors.jira`. Drives the "Filed by me" stat card and the `/filed` page.
+Every card whose Jira **reporter** is the configured `accountId`, site-wide (not limited to `projectKey`) and in any status, ordered by `created` descending. A second JQL query per refresh, incremental: it fetches only recently updated cards and merges them into the previous list. A full refetch runs every 24 hours (and immediately when `jira.accountId` or `jira.baseUrl` changes), which drops deleted or moved cards. If the query fails, the previous list is kept (or emptied after an account/site change) and the failure is appended to `errors.jira`. Drives the "Filed by me" stat card and the `/filed` page.
 
 ### doneTotal / newlyDone
 
