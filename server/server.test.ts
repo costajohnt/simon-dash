@@ -1,6 +1,7 @@
 import { test, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createServer, bundleStatus, readBody, BodyTooLarge, MAX_BODY_BYTES } from './index.ts';
+import { createServer, bundleStatus, readBody, BodyTooLarge, MAX_BODY_BYTES, createSseFanout, SSE_MAX_BUFFERED_BYTES } from './index.ts';
 import { PassThrough } from 'node:stream';
+import { EventEmitter } from 'node:events';
 import { saveState, emptyState } from './state.ts';
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
@@ -518,6 +519,89 @@ test('GET /api/events rejects a spoofed Host header', async () => {
   const { port } = new URL(base);
   const res = await requestWithHost(Number(port), '/api/events', 'evil.com', 'GET');
   expect(res.status).toBe(403);
+});
+
+// --- SSE backpressure (createSseFanout) ---
+// Fake response: `accept` decides what write() returns (false = kernel/TCP
+// window full, data queued), and drain() emits 'drain' on demand, so the
+// policy is exercised deterministically without stalling a real socket.
+class FakeSseClient extends EventEmitter {
+  writes: string[] = [];
+  destroyed = false;
+  writableLength = 0;
+  accept = true;
+  write(chunk: string): boolean {
+    this.writes.push(chunk);
+    if (!this.accept) this.writableLength += chunk.length;
+    return this.accept;
+  }
+  destroy() { this.destroyed = true; }
+  drain() { this.accept = true; this.writableLength = 0; this.emit('drain'); }
+}
+
+test('SSE fan-out drops a client still congested at the next broadcast, healthy clients keep receiving', () => {
+  const sse = createSseFanout<FakeSseClient>();
+  const healthy = new FakeSseClient();
+  const stalled = new FakeSseClient();
+  sse.add(healthy, 'connect');
+  sse.add(stalled, 'connect');
+  stalled.accept = false; // consumer stops reading; never drains
+  sse.broadcast('a'); // write() returns false -> congested
+  expect(stalled.destroyed).toBe(false);
+  sse.broadcast('b'); // still congested -> dropped, 'b' not queued
+  expect(stalled.destroyed).toBe(true);
+  expect(stalled.writes).toEqual(['connect', 'a']);
+  expect(sse.clients.has(stalled)).toBe(false);
+  sse.broadcast('c');
+  expect(stalled.writes).toEqual(['connect', 'a']);
+  expect(healthy.writes).toEqual(['connect', 'a', 'b', 'c']);
+  expect(healthy.destroyed).toBe(false);
+});
+
+test('SSE fan-out keeps a congested client that drains before the next broadcast', () => {
+  const sse = createSseFanout<FakeSseClient>();
+  const client = new FakeSseClient();
+  sse.add(client, 'connect');
+  client.accept = false;
+  sse.broadcast('a'); // congested
+  client.drain(); // consumer caught up in time
+  sse.broadcast('b');
+  sse.broadcast('c');
+  expect(client.destroyed).toBe(false);
+  expect(sse.clients.has(client)).toBe(true);
+  expect(client.writes).toEqual(['connect', 'a', 'b', 'c']);
+});
+
+test('SSE fan-out drops a client whose connect replay never drains', () => {
+  const sse = createSseFanout<FakeSseClient>();
+  const client = new FakeSseClient();
+  client.accept = false;
+  sse.add(client, 'connect');
+  sse.broadcast('a');
+  expect(client.destroyed).toBe(true);
+  expect(client.writes).toEqual(['connect']);
+});
+
+test('SSE fan-out drops a client buffering past SSE_MAX_BUFFERED_BYTES even if not flagged congested', () => {
+  const sse = createSseFanout<FakeSseClient>();
+  const client = new FakeSseClient();
+  sse.add(client, 'connect');
+  client.writableLength = SSE_MAX_BUFFERED_BYTES + 1;
+  sse.broadcast('a');
+  expect(client.destroyed).toBe(true);
+  expect(client.writes).toEqual(['connect']);
+});
+
+test('SSE fan-out isolates a client whose write throws', () => {
+  const sse = createSseFanout<FakeSseClient>();
+  const bad = new FakeSseClient();
+  const good = new FakeSseClient();
+  sse.add(bad, 'connect');
+  sse.add(good, 'connect');
+  bad.write = () => { throw new Error('EPIPE'); };
+  expect(() => sse.broadcast('a')).not.toThrow();
+  expect(sse.clients.has(bad)).toBe(false);
+  expect(good.writes).toEqual(['connect', 'a']);
 });
 
 // Spins up a server whose scheduled loop runs every second against an
