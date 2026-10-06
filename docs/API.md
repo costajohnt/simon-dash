@@ -29,7 +29,7 @@ Server-Sent Events stream of snapshots. On connect the server immediately sends 
 
 A refresh whose content is identical to the last broadcast (only `updatedAt` moved) is not re-sent in full; instead the stream carries a named `tick` event whose data is `{ "updatedAt": "..." }`, so clients can keep their "last checked" display current without re-rendering an unchanged board.
 
-Slow consumers are disconnected rather than buffered. If the server can't flush an event to a stream (the socket's send buffer is full, e.g. a suspended laptop tab) and that stream still hasn't drained when the next event is due, or more than 1 MB is queued for it, the server closes the stream. Clients should reconnect, as `EventSource` does by itself and the web UI does with backoff. Nothing is lost: every new connection starts with the current snapshot.
+Slow consumers are disconnected rather than buffered. If a stream stops reading (e.g. a suspended laptop tab whose socket buffer is full) and more than 4 MB of unsent events have queued for it by the time the next event is due, the server closes the stream instead of queueing more. Brief stalls under that bound are buffered and delivered normally. Clients should reconnect, as `EventSource` does by itself and the web UI does with backoff. Nothing is lost: every new connection starts with the current snapshot.
 
 This is what makes the web UI live: the client holds one `EventSource` open instead of polling, so every open tab re-renders within one server tick of anything changing, and background-tab timer throttling doesn't matter.
 

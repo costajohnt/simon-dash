@@ -92,44 +92,40 @@ function guardMutation(req: IncomingMessage): { status: number; error: string } 
 // not what each stream holds: res.write() never refuses data, it just
 // returns false and queues in heap, so one stalled consumer (a suspended
 // laptop tab with a full TCP window) would accumulate every future snapshot.
-export const SSE_MAX_BUFFERED_BYTES = 1_000_000;
+// 4 MB lets a couple of large snapshots queue through a brief hiccup; worst
+// case stays ~32 streams × (cap + one snapshot).
+export const SSE_MAX_BUFFERED_BYTES = 4_000_000;
 
 // The subset of ServerResponse the SSE fan-out uses, so tests can drive the
-// backpressure policy with a fake that never drains.
+// backpressure policy with a fake whose buffer never empties.
 export interface SseClient {
   write(chunk: string): boolean;
   destroy(): unknown;
   readonly destroyed: boolean;
   readonly writableLength: number;
-  once(event: 'drain', listener: () => void): unknown;
 }
 
-// Backpressure policy: a write() that returns false marks the client
-// congested until its 'drain'. A client still congested when the next event
-// arrives (or already buffering past SSE_MAX_BUFFERED_BYTES) is destroyed and
-// dropped instead of being queued another full snapshot. Nothing is lost:
-// EventSource / useData()'s backoff reconnects, and /api/events sends the
-// current snapshot on connect. A healthy loopback reader drains within
-// milliseconds, far inside any gap between broadcasts.
+// Backpressure policy: before each write, a client already buffering more
+// than SSE_MAX_BUFFERED_BYTES is destroyed and dropped instead of queued
+// another snapshot. Deliberately not "drop if write() returned false last
+// time": a snapshot over the 16 KB highWaterMark makes write() return false
+// even for a healthy tab, and back-to-back broadcasts (ack then move, an
+// action right after a refresh) land within milliseconds. Nothing is lost
+// by dropping: EventSource / useData()'s backoff reconnects, and
+// /api/events sends the current snapshot on connect.
 export function createSseFanout<C extends SseClient>() {
   const clients = new Set<C>();
-  const congested = new WeakSet<C>();
   const drop = (client: C) => {
     clients.delete(client);
-    congested.delete(client);
     try { client.destroy(); } catch { /* already torn down */ }
   };
   const writeTo = (client: C, msg: string) => {
-    if (congested.has(client) || client.writableLength > SSE_MAX_BUFFERED_BYTES) return drop(client);
-    if (!client.write(msg)) {
-      congested.add(client);
-      client.once('drain', () => congested.delete(client));
-    }
+    if (client.writableLength > SSE_MAX_BUFFERED_BYTES) return drop(client);
+    client.write(msg);
   };
   return {
     clients,
-    // Connect replay goes through writeTo too, so a reader that never
-    // consumes even its first snapshot is dropped on the next broadcast.
+    // Connect replay counts toward the cap like any other event.
     add(client: C, msg: string) {
       clients.add(client);
       writeTo(client, msg);

@@ -1,7 +1,6 @@
 import { test, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createServer, bundleStatus, readBody, BodyTooLarge, MAX_BODY_BYTES, createSseFanout, SSE_MAX_BUFFERED_BYTES } from './index.ts';
 import { PassThrough } from 'node:stream';
-import { EventEmitter } from 'node:events';
 import { saveState, emptyState } from './state.ts';
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
@@ -522,74 +521,57 @@ test('GET /api/events rejects a spoofed Host header', async () => {
 });
 
 // --- SSE backpressure (createSseFanout) ---
-// Fake response: `accept` decides what write() returns (false = kernel/TCP
-// window full, data queued), and drain() emits 'drain' on demand, so the
-// policy is exercised deterministically without stalling a real socket.
-class FakeSseClient extends EventEmitter {
+// Fake response modeling Node's writable buffer: a stalled one keeps every
+// chunk in writableLength (the consumer never reads), a healthy one flushes
+// at once. write() returns false past the 16 KB highWaterMark, like the real
+// thing, so the policy is exercised deterministically without a socket.
+class FakeSseClient {
   writes: string[] = [];
   destroyed = false;
   writableLength = 0;
-  accept = true;
+  stalled = false;
   write(chunk: string): boolean {
     this.writes.push(chunk);
-    if (!this.accept) this.writableLength += chunk.length;
-    return this.accept;
+    if (this.stalled) this.writableLength += chunk.length;
+    return chunk.length < 16_384 && this.writableLength < 16_384;
   }
   destroy() { this.destroyed = true; }
-  drain() { this.accept = true; this.writableLength = 0; this.emit('drain'); }
 }
 
-test('SSE fan-out drops a client still congested at the next broadcast, healthy clients keep receiving', () => {
+test('SSE fan-out keeps a client whose write() returned false across back-to-back broadcasts while under the cap', () => {
+  const sse = createSseFanout<FakeSseClient>();
+  const client = new FakeSseClient();
+  sse.add(client, 'connect');
+  client.stalled = true; // momentarily not flushing (e.g. mid-render)
+  const big = 'x'.repeat(100_000); // over highWaterMark: write() returns false
+  sse.broadcast(big); // e.g. ack ...
+  sse.broadcast(big); // ... then move, milliseconds apart
+  expect(client.destroyed).toBe(false);
+  expect(sse.clients.has(client)).toBe(true);
+  expect(client.writes).toEqual(['connect', big, big]);
+});
+
+test('SSE fan-out drops a client over SSE_MAX_BUFFERED_BYTES without writing to it; healthy clients unaffected', () => {
   const sse = createSseFanout<FakeSseClient>();
   const healthy = new FakeSseClient();
   const stalled = new FakeSseClient();
   sse.add(healthy, 'connect');
   sse.add(stalled, 'connect');
-  stalled.accept = false; // consumer stops reading; never drains
-  sse.broadcast('a'); // write() returns false -> congested
+  stalled.stalled = true; // suspended tab: never reads again
+  const snap = 'x'.repeat(1_500_000);
+  const writesBeforeCap = Math.floor(SSE_MAX_BUFFERED_BYTES / snap.length) + 1;
+  for (let i = 0; i < writesBeforeCap; i++) sse.broadcast(snap);
+  expect(stalled.writableLength).toBeGreaterThan(SSE_MAX_BUFFERED_BYTES);
   expect(stalled.destroyed).toBe(false);
-  sse.broadcast('b'); // still congested -> dropped, 'b' not queued
+  sse.broadcast('next'); // over the cap: dropped instead of written
   expect(stalled.destroyed).toBe(true);
-  expect(stalled.writes).toEqual(['connect', 'a']);
   expect(sse.clients.has(stalled)).toBe(false);
-  sse.broadcast('c');
-  expect(stalled.writes).toEqual(['connect', 'a']);
-  expect(healthy.writes).toEqual(['connect', 'a', 'b', 'c']);
+  expect(stalled.writes).not.toContain('next');
+  sse.broadcast('after');
+  expect(stalled.writes).toHaveLength(1 + writesBeforeCap);
   expect(healthy.destroyed).toBe(false);
-});
-
-test('SSE fan-out keeps a congested client that drains before the next broadcast', () => {
-  const sse = createSseFanout<FakeSseClient>();
-  const client = new FakeSseClient();
-  sse.add(client, 'connect');
-  client.accept = false;
-  sse.broadcast('a'); // congested
-  client.drain(); // consumer caught up in time
-  sse.broadcast('b');
-  sse.broadcast('c');
-  expect(client.destroyed).toBe(false);
-  expect(sse.clients.has(client)).toBe(true);
-  expect(client.writes).toEqual(['connect', 'a', 'b', 'c']);
-});
-
-test('SSE fan-out drops a client whose connect replay never drains', () => {
-  const sse = createSseFanout<FakeSseClient>();
-  const client = new FakeSseClient();
-  client.accept = false;
-  sse.add(client, 'connect');
-  sse.broadcast('a');
-  expect(client.destroyed).toBe(true);
-  expect(client.writes).toEqual(['connect']);
-});
-
-test('SSE fan-out drops a client buffering past SSE_MAX_BUFFERED_BYTES even if not flagged congested', () => {
-  const sse = createSseFanout<FakeSseClient>();
-  const client = new FakeSseClient();
-  sse.add(client, 'connect');
-  client.writableLength = SSE_MAX_BUFFERED_BYTES + 1;
-  sse.broadcast('a');
-  expect(client.destroyed).toBe(true);
-  expect(client.writes).toEqual(['connect']);
+  expect(healthy.writes.slice(-2)).toEqual(['next', 'after']);
+  expect(healthy.writes).toHaveLength(1 + writesBeforeCap + 2);
 });
 
 test('SSE fan-out isolates a client whose write throws', () => {
